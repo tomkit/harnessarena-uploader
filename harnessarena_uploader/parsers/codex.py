@@ -17,9 +17,39 @@ class CodexParser(HarnessParser):
     Codex JSONL stores events as {type, payload, timestamp} envelopes.
     Tool calls appear as response_item with payload.type == "function_call"
     and payload.name == tool name (e.g. "shell", "read_file").
+    Plugins registered in ~/.codex/config.toml provide MCP tools
+    (e.g. github@openai-curated → mcp__codex_apps__github_*).
     """
 
     harness_type = Harness.CODEX
+
+    def __init__(self) -> None:
+        # Build plugin registry from config.toml
+        self._plugin_names: set[str] = set()
+        config_path = Path.home() / ".codex" / "config.toml"
+        if config_path.is_file():
+            try:
+                with open(config_path, "r") as f:
+                    for line in f:
+                        # Parse [plugins."name@source"] sections
+                        line = line.strip()
+                        if line.startswith("[plugins."):
+                            name = line.split('"')[1] if '"' in line else ""
+                            if name:
+                                self._plugin_names.add(name.split("@")[0])
+            except OSError:
+                pass
+
+    def detect_skill(self, tool_name: str, tool_input: dict) -> Optional[str]:
+        # Codex plugin tools appear as mcp__codex_apps__<plugin>_<action>
+        if tool_name.startswith("mcp__codex_apps__"):
+            parts = tool_name.split("__")
+            if len(parts) >= 3:
+                plugin_tool = parts[2]  # e.g. "github_get_profile"
+                plugin_name = plugin_tool.split("_")[0]  # e.g. "github"
+                if plugin_name in self._plugin_names:
+                    return plugin_name
+        return None
 
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
         return _parse_codex(since, parser=self)
@@ -134,6 +164,7 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                 mcp_calls = 0
                 plan_mode_entries = 0
                 plan_mode_exits = 0
+                skill_invocations: dict[str, int] = {}
                 jsonl_session_id: Optional[str] = None
                 jsonl_project: Optional[str] = None
                 jsonl_version: Optional[str] = None
@@ -180,6 +211,8 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                                             background_agents += 1
                                     if c["is_mcp"]:
                                         mcp_calls += 1
+                                    if c["skill_name"]:
+                                        skill_invocations[c["skill_name"]] = skill_invocations.get(c["skill_name"], 0) + 1
                                     if c["is_plan_enter"]:
                                         plan_mode_entries += 1
                                     if c["is_plan_exit"]:
@@ -204,6 +237,10 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                     d["tool_calls"] = tuple(
                         ToolCallSummary(n, c) for n, c in sorted(tool_names.items())
                     )
+                    d["skills_used"] = {
+                        name: {"count": count, "source": "plugin"}
+                        for name, count in skill_invocations.items()
+                    }
                     results[idx] = SessionMeta(**d)
 
             except (OSError, PermissionError):

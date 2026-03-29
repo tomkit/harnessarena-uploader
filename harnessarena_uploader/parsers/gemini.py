@@ -15,6 +15,7 @@ class GeminiParser(HarnessParser):
 
     Gemini stores tool calls in msg.toolCalls array with {name, args, result}.
     Subagents appear as tool calls with name like "generalist", "cli_help", etc.
+    Skills/extensions are installed at ~/.gemini/skills/ and ~/.agents/skills/.
     Thoughts/reasoning appear in msg.thoughts array and tokens.thoughts count.
     """
 
@@ -23,11 +24,36 @@ class GeminiParser(HarnessParser):
     # Gemini's built-in subagent tool names
     _SUBAGENT_TOOLS = {"generalist", "cli_help", "codebase_investigator"}
 
+    # Built-in tools that are NOT skills
+    _BUILTIN_TOOLS = {
+        "read_file", "write_file", "run_shell_command", "replace",
+        "list_directory", "grep", "grep_search", "generalist",
+        "cli_help", "codebase_investigator",
+    }
+
+    def __init__(self) -> None:
+        # Build skill registry from installed extensions/skills
+        self._skill_names: set[str] = set()
+        for skills_dir in [
+            Path.home() / ".gemini" / "skills",
+            Path.home() / ".agents" / "skills",
+        ]:
+            if skills_dir.is_dir():
+                for d in skills_dir.iterdir():
+                    if d.is_dir():
+                        self._skill_names.add(d.name)
+
     def detect_subagent(self, tool_name: str, tool_input: dict) -> bool:
         return tool_name in self._SUBAGENT_TOOLS
 
     def detect_mcp_call(self, tool_name: str) -> bool:
         return tool_name.startswith("mcp__")
+
+    def detect_skill(self, tool_name: str, tool_input: dict) -> Optional[str]:
+        # Non-builtin tool names that match installed skills
+        if tool_name not in self._BUILTIN_TOOLS and tool_name in self._skill_names:
+            return tool_name
+        return None
 
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
         return _parse_gemini(since, parser=self)
@@ -102,6 +128,7 @@ def _parse_gemini(since: Optional[datetime] = None, parser: Optional[HarnessPars
             tool_names: dict[str, int] = {}
             subagent_calls = 0
             mcp_calls = 0
+            skill_invocations: dict[str, int] = {}
             has_thoughts = False
 
             for msg in messages:
@@ -138,6 +165,8 @@ def _parse_gemini(since: Optional[datetime] = None, parser: Optional[HarnessPars
                                 subagent_calls += 1
                             if c["is_mcp"]:
                                 mcp_calls += 1
+                            if c["skill_name"]:
+                                skill_invocations[c["skill_name"]] = skill_invocations.get(c["skill_name"], 0) + 1
 
                 # Detect thinking/reasoning from thoughts array
                 thoughts = msg.get("thoughts", [])
@@ -181,6 +210,10 @@ def _parse_gemini(since: Optional[datetime] = None, parser: Optional[HarnessPars
                 tool_calls=tuple(
                     ToolCallSummary(n, c) for n, c in sorted(tool_names.items())
                 ),
+                skills_used={
+                    name: {"count": count, "source": "extension"}
+                    for name, count in skill_invocations.items()
+                },
                 cost_usd=None,
                 started_at=started_at,
                 ended_at=ended_at,
