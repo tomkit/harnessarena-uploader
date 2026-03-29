@@ -97,6 +97,9 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
             model = "unknown"
             provider: Optional[str] = None
             ended_at = ""
+            # Track agent/mode from message data for plan mode + skill detection
+            agent_names: set[str] = set()
+            skill_invocations: dict[str, int] = {}
 
             for msg_row in cursor.fetchall():
                 total_count += 1
@@ -110,6 +113,14 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
                     user_count += 1
                 elif role == "assistant":
                     assistant_count += 1
+
+                # Track agent name and mode from message metadata
+                # "build" = normal, "plan" = plan mode, other = custom agent/skill
+                agent_name = data.get("agent", "")
+                if agent_name and agent_name not in ("build", ""):
+                    agent_names.add(agent_name)
+                    if agent_name != "plan":
+                        skill_invocations[agent_name] = skill_invocations.get(agent_name, 0) + 1
 
                 # Model can be at data.modelID or data.model.modelID
                 m = data.get("modelID") or data.get("model")
@@ -228,12 +239,16 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
                 subagent_calls=max(subagent_calls, spawn_counts.get(session_id, 0)),
                 background_agents=background_agents,
                 mcp_calls=mcp_calls,
-                plan_mode_entries=max(plan_entries, plan_mode_entries),
-                plan_mode_exits=max(plan_entries, plan_mode_exits),
+                plan_mode_entries=max(plan_entries, plan_mode_entries, int("plan" in agent_names)),
+                plan_mode_exits=max(plan_entries, plan_mode_exits, int("plan" in agent_names)),
                 tool_calls=tuple(
                     ToolCallSummary(name, count)
                     for name, count in sorted(tool_counts.items())
                 ),
+                skills_used={
+                    name: {"count": count, "source": "agent"}
+                    for name, count in skill_invocations.items()
+                },
                 cost_usd=cost if cost > 0 else None,
                 started_at=started_at,
                 ended_at=ended_at if ended_at else None,

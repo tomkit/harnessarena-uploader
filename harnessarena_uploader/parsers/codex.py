@@ -229,11 +229,11 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                     d["message_count_assistant"] = assistant_count
                     d["message_count_total"] = total_count
                     d["tool_call_count"] = tool_count
-                    d["subagent_calls"] = subagent_calls
+                    d["subagent_calls"] = max(old.subagent_calls, subagent_calls)
                     d["background_agents"] = background_agents
                     d["mcp_calls"] = mcp_calls
-                    d["plan_mode_entries"] = plan_mode_entries
-                    d["plan_mode_exits"] = plan_mode_exits
+                    d["plan_mode_entries"] = max(old.plan_mode_entries, plan_mode_entries)
+                    d["plan_mode_exits"] = max(old.plan_mode_exits, plan_mode_exits)
                     d["tool_calls"] = tuple(
                         ToolCallSummary(n, c) for n, c in sorted(tool_names.items())
                     )
