@@ -176,6 +176,13 @@ class SessionMeta:
     # --- Cost ---------------------------------------------------------------
     cost_usd: Optional[float] = None
 
+    # --- Data completeness ----------------------------------------------------
+    is_pruned: bool = False  # True if session data was partially recovered
+                             # (e.g., from sessions-index or history.jsonl
+                             # after JSONL files were garbage-collected).
+                             # Pruned sessions have prompt counts but no
+                             # token/tool data. UI should disclose this.
+
     # --- Derived metrics ----------------------------------------------------
     intervention_rate: Optional[float] = None  # user prompts / tool calls
 
