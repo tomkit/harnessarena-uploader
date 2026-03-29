@@ -45,7 +45,8 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
         # created_at in Codex is Unix epoch seconds (integer)
         query = """
             SELECT id, cwd, model, title, tokens_used, source,
-                   cli_version, git_sha, git_branch, created_at
+                   cli_version, git_sha, git_branch, created_at,
+                   sandbox_policy
             FROM threads
         """
         params: list = []
@@ -64,6 +65,15 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
             harness_version = row["cli_version"]
             started_at = _parse_timestamp(row["created_at"])
 
+            # Detect plan mode from sandbox_policy: read-only = plan mode
+            plan_entries = 0
+            try:
+                sandbox = json.loads(row["sandbox_policy"]) if row["sandbox_policy"] else {}
+                if isinstance(sandbox, dict) and sandbox.get("type") == "read-only":
+                    plan_entries = 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+
             results.append(SessionMeta(
                 id=_make_session_id(Harness.CODEX, source_id),
                 source_session_id=source_id,
@@ -74,11 +84,13 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                 git_branch=git_branch,
                 model=model,
                 provider="openai",
-                message_count_user=0,     # not in threads table; would need JSONL parse
+                message_count_user=0,
                 message_count_assistant=0,
                 message_count_total=0,
                 tool_call_count=0,
                 tokens=TokenUsage(total_tokens=total_tokens),
+                plan_mode_entries=plan_entries,
+                plan_mode_exits=plan_entries,
                 started_at=started_at,
             ))
 

@@ -7,19 +7,33 @@ from typing import Optional
 
 from ..base_parser import HarnessParser
 from ..helpers import _basename_only, _make_session_id, _safe_int
-from ..models import Harness, SessionMeta, TokenUsage
+from ..models import Harness, SessionMeta, TokenUsage, ToolCallSummary
 
 
 class GeminiParser(HarnessParser):
-    """Gemini CLI session parser."""
+    """Gemini CLI session parser.
+
+    Gemini stores tool calls in msg.toolCalls array with {name, args, result}.
+    Subagents appear as tool calls with name like "generalist", "cli_help", etc.
+    Thoughts/reasoning appear in msg.thoughts array and tokens.thoughts count.
+    """
 
     harness_type = Harness.GEMINI
 
+    # Gemini's built-in subagent tool names
+    _SUBAGENT_TOOLS = {"generalist", "cli_help", "codebase_investigator"}
+
+    def detect_subagent(self, tool_name: str, tool_input: dict) -> bool:
+        return tool_name in self._SUBAGENT_TOOLS
+
+    def detect_mcp_call(self, tool_name: str) -> bool:
+        return tool_name.startswith("mcp__")
+
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
-        return _parse_gemini(since)
+        return _parse_gemini(since, parser=self)
 
 
-def _parse_gemini(since: Optional[datetime] = None) -> list[SessionMeta]:
+def _parse_gemini(since: Optional[datetime] = None, parser: Optional[HarnessParser] = None) -> list[SessionMeta]:
     """Parse Gemini CLI JSON session files.
 
     Path: ~/.gemini/tmp/{project_hash}/chats/session-{date}-{id}.json
@@ -84,6 +98,11 @@ def _parse_gemini(since: Optional[datetime] = None) -> list[SessionMeta]:
             output_tokens = 0
             cache_read = 0
             tool_tokens = 0
+            tool_call_count = 0
+            tool_names: dict[str, int] = {}
+            subagent_calls = 0
+            mcp_calls = 0
+            has_thoughts = False
 
             for msg in messages:
                 msg_type = msg.get("type", "")
@@ -91,7 +110,6 @@ def _parse_gemini(since: Optional[datetime] = None) -> list[SessionMeta]:
                     user_count += 1
                 elif msg_type in ("gemini", "assistant", "model"):
                     assistant_count += 1
-                    # Model is on assistant messages
                     m = msg.get("model")
                     if m:
                         model = m
@@ -100,8 +118,31 @@ def _parse_gemini(since: Optional[datetime] = None) -> list[SessionMeta]:
                 input_tokens += _safe_int(tokens.get("input"))
                 output_tokens += _safe_int(tokens.get("output"))
                 cache_read += _safe_int(tokens.get("cached"))
-                # Gemini reports tool tokens separately — non-zero means tools were used
                 tool_tokens += _safe_int(tokens.get("tool"))
+
+                # Extract tool calls from toolCalls array
+                tool_calls_list = msg.get("toolCalls", [])
+                if isinstance(tool_calls_list, list):
+                    for tc in tool_calls_list:
+                        if not isinstance(tc, dict):
+                            continue
+                        tool_name = tc.get("name", "unknown")
+                        tool_call_count += 1
+                        tool_names[tool_name] = tool_names.get(tool_name, 0) + 1
+                        if parser:
+                            args = tc.get("args", {})
+                            if not isinstance(args, dict):
+                                args = {}
+                            c = parser.classify_tool_call(tool_name, args)
+                            if c["is_subagent"]:
+                                subagent_calls += 1
+                            if c["is_mcp"]:
+                                mcp_calls += 1
+
+                # Detect thinking/reasoning from thoughts array
+                thoughts = msg.get("thoughts", [])
+                if thoughts:
+                    has_thoughts = True
 
             total_count = len(messages)
 
@@ -128,12 +169,17 @@ def _parse_gemini(since: Optional[datetime] = None) -> list[SessionMeta]:
                 message_count_user=user_count,
                 message_count_assistant=assistant_count,
                 message_count_total=total_count,
-                tool_call_count=0,
+                tool_call_count=tool_call_count,
+                subagent_calls=subagent_calls,
+                mcp_calls=mcp_calls,
                 tokens=TokenUsage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read,
                     total_tokens=input_tokens + output_tokens,
+                ),
+                tool_calls=tuple(
+                    ToolCallSummary(n, c) for n, c in sorted(tool_names.items())
                 ),
                 cost_usd=None,
                 started_at=started_at,

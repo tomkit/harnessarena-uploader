@@ -45,7 +45,7 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
         cursor = conn.cursor()
 
         # time_created is Unix epoch milliseconds in OpenCode
-        query = "SELECT id, project_id, title, directory, time_created FROM session"
+        query = "SELECT id, project_id, title, directory, time_created, permission FROM session"
         params: list = []
         if since:
             query += " WHERE time_created >= ?"
@@ -58,6 +58,20 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
             session_id = str(session_row["id"])
             project_name = _basename_only(session_row["directory"])
             started_at = _parse_timestamp(session_row["time_created"])
+
+            # Detect plan mode from permission field
+            # OpenCode stores permissions as JSON array with plan_enter/plan_exit entries
+            # action="allow" means plan mode is enabled for the session
+            plan_entries = 0
+            try:
+                perms = json.loads(session_row["permission"]) if session_row["permission"] else []
+                if isinstance(perms, list):
+                    for perm in perms:
+                        if isinstance(perm, dict) and perm.get("permission") == "plan_enter":
+                            if perm.get("action") == "allow":
+                                plan_entries = 1
+            except (json.JSONDecodeError, TypeError):
+                pass
 
             # Aggregate message metadata — read only role, model ID, tokens, cost
             # NEVER read content, summary text, or diffs
@@ -206,8 +220,8 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
                 subagent_calls=subagent_calls,
                 background_agents=background_agents,
                 mcp_calls=mcp_calls,
-                plan_mode_entries=plan_mode_entries,
-                plan_mode_exits=plan_mode_exits,
+                plan_mode_entries=max(plan_entries, plan_mode_entries),
+                plan_mode_exits=max(plan_entries, plan_mode_exits),
                 tool_calls=tuple(
                     ToolCallSummary(name, count)
                     for name, count in sorted(tool_counts.items())

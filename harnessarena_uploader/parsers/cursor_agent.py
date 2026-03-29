@@ -101,6 +101,10 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                     except ValueError:
                         pass
 
+                # Detect plan mode from meta.mode field
+                session_mode = raw.get("mode", "default")
+                is_plan_mode = session_mode == "plan"
+
                 # Parse blobs for message counts, tool calls, and token estimation.
                 # Cursor Agent doesn't report token counts, so we estimate:
                 # ~4 chars per token for English text.
@@ -214,8 +218,8 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                     subagent_calls=subagent_calls,
                     background_agents=background_agents,
                     mcp_calls=mcp_calls,
-                    plan_mode_entries=plan_mode_entries,
-                    plan_mode_exits=plan_mode_exits,
+                    plan_mode_entries=max(int(is_plan_mode), plan_mode_entries),
+                    plan_mode_exits=max(int(is_plan_mode), plan_mode_exits),
                     tokens=TokenUsage(
                         input_tokens=estimated_input_tokens,
                         output_tokens=estimated_output_tokens,
