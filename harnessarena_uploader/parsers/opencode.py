@@ -45,7 +45,7 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
         cursor = conn.cursor()
 
         # time_created is Unix epoch milliseconds in OpenCode
-        query = "SELECT id, project_id, title, directory, time_created, permission FROM session"
+        query = "SELECT id, project_id, parent_id, title, directory, time_created, permission FROM session"
         params: list = []
         if since:
             query += " WHERE time_created >= ?"
@@ -53,6 +53,14 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
 
         cursor.execute(query, params)
         sessions = cursor.fetchall()
+
+        # Count subagent spawns per parent session
+        # Sessions with non-null parent_id are subagent sessions
+        spawn_counts: dict[str, int] = {}
+        for s in sessions:
+            parent = s["parent_id"]
+            if parent:
+                spawn_counts[str(parent)] = spawn_counts.get(str(parent), 0) + 1
 
         for session_row in sessions:
             session_id = str(session_row["id"])
@@ -217,7 +225,7 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
                     output_tokens=output_tokens,
                     total_tokens=input_tokens + output_tokens,
                 ),
-                subagent_calls=subagent_calls,
+                subagent_calls=max(subagent_calls, spawn_counts.get(session_id, 0)),
                 background_agents=background_agents,
                 mcp_calls=mcp_calls,
                 plan_mode_entries=max(plan_entries, plan_mode_entries),

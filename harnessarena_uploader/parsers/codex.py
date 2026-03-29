@@ -55,8 +55,20 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
             params.append(int(since.replace(tzinfo=timezone.utc).timestamp()))
 
         cursor.execute(query, params)
+        thread_rows = cursor.fetchall()
 
-        for row in cursor.fetchall():
+        # Count subagent spawns per parent thread from thread_spawn_edges
+        spawn_counts: dict[str, int] = {}
+        try:
+            edges = cursor.execute(
+                "SELECT parent_thread_id, COUNT(*) as cnt FROM thread_spawn_edges GROUP BY parent_thread_id"
+            ).fetchall()
+            for e in edges:
+                spawn_counts[str(e["parent_thread_id"])] = e["cnt"]
+        except sqlite3.OperationalError:
+            pass  # table may not exist in older versions
+
+        for row in thread_rows:
             source_id = str(row["id"])
             model = row["model"] if row["model"] else "unknown"
             total_tokens = _safe_int(row["tokens_used"])
@@ -74,6 +86,9 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
             except (json.JSONDecodeError, TypeError):
                 pass
 
+            # Subagent count from thread_spawn_edges
+            sub_count = spawn_counts.get(source_id, 0)
+
             results.append(SessionMeta(
                 id=_make_session_id(Harness.CODEX, source_id),
                 source_session_id=source_id,
@@ -89,6 +104,7 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                 message_count_total=0,
                 tool_call_count=0,
                 tokens=TokenUsage(total_tokens=total_tokens),
+                subagent_calls=sub_count,
                 plan_mode_entries=plan_entries,
                 plan_mode_exits=plan_entries,
                 started_at=started_at,
