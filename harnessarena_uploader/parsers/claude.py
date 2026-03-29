@@ -7,6 +7,20 @@ from pathlib import Path
 from typing import Optional
 
 from ..base_parser import HarnessParser
+from ..history_paths import get_claude_history_paths
+from ..metric_strategies import (
+    ConstantSessionsMetricStrategy,
+    HarnessMetricStrategies,
+    SnapshotCostMetricStrategy,
+    SnapshotDailyMetricStrategy,
+    SnapshotMCPMetricStrategy,
+    SnapshotPlanMetricStrategy,
+    SnapshotPromptMetricStrategy,
+    SnapshotSkillMetricStrategy,
+    SnapshotSubagentMetricStrategy,
+    SnapshotTokenMetricStrategy,
+    SnapshotToolMetricStrategy,
+)
 from ..helpers import (
     _basename_only,
     _decode_claude_project_dir,
@@ -21,6 +35,21 @@ class ClaudeParser(HarnessParser):
     """Claude Code session parser."""
 
     harness_type = Harness.CLAUDE
+
+    def __init__(self) -> None:
+        self._paths = get_claude_history_paths()
+        self._strategies = HarnessMetricStrategies(
+            sessions=ConstantSessionsMetricStrategy(),
+            prompts=SnapshotPromptMetricStrategy(),
+            subagents=SnapshotSubagentMetricStrategy(),
+            mcp=SnapshotMCPMetricStrategy(),
+            skills=SnapshotSkillMetricStrategy(),
+            tools=SnapshotToolMetricStrategy(),
+            tokens=SnapshotTokenMetricStrategy(),
+            plan=SnapshotPlanMetricStrategy(),
+            daily=SnapshotDailyMetricStrategy(),
+            cost=SnapshotCostMetricStrategy(),
+        )
 
     def detect_subagent(self, tool_name: str, tool_input: dict) -> bool:
         return tool_name == "Agent"
@@ -45,12 +74,38 @@ class ClaudeParser(HarnessParser):
         return tool_name == "ExitPlanMode"
 
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
-        return _parse_claude(since, parser=self)
+        return _parse_claude(since, parser=self, paths=self._paths)
+
+    def metric_strategies(self) -> HarnessMetricStrategies:
+        return self._strategies
+
+
+def _register_mcp_tool(mcp_servers: dict[str, dict], tool_name: str) -> None:
+    if not tool_name.startswith("mcp__"):
+        return
+    remainder = tool_name[len("mcp__") :]
+    server_name = remainder
+    primitive_name = tool_name
+    if "__" in remainder:
+        server_name, primitive_name = remainder.split("__", 1)
+    elif "_" in remainder:
+        server_name, primitive_name = remainder.split("_", 1)
+    server = mcp_servers.setdefault(
+        server_name,
+        {"invocation_count": 0, "uri": None, "primitives": {}},
+    )
+    server["invocation_count"] += 1
+    primitive = server["primitives"].setdefault(
+        primitive_name,
+        {"primitive_type": "tool", "invocation_count": 0},
+    )
+    primitive["invocation_count"] += 1
 
 
 def _parse_claude(
     since: Optional[datetime] = None,
     parser: Optional[HarnessParser] = None,
+    paths=None,
 ) -> list[SessionMeta]:
     """Parse Claude Code session metadata from ALL storage locations.
 
@@ -74,7 +129,8 @@ def _parse_claude(
     all_prompt_keys: set[str] = set()
 
     # --- Source 1: JSONL sessions in ~/.claude/projects/ (rich data) ---
-    projects_dir = Path.home() / ".claude" / "projects"
+    paths = paths or get_claude_history_paths()
+    projects_dir = paths.projects_dir
     if projects_dir.is_dir():
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
@@ -135,31 +191,26 @@ def _parse_claude(
                             except ValueError:
                                 pass
 
-                        results.append(SessionMeta(
-                            id=_make_session_id(Harness.CLAUDE, source_id),
-                            source_session_id=source_id,
-                            harness=Harness.CLAUDE,
-                            harness_version=None,
-                            project_name=idx_project,
-                            git_repo_name=idx_project,
-                            git_branch=entry.get("gitBranch"),
-                            model="unknown",
-                            provider="anthropic",
-                            # messageCount includes user+assistant — not a reliable
-                            # user prompt count. Set to 0; history.jsonl provides
-                            # accurate per-prompt deduped counts via Source 1c.
-                            message_count_user=0,
-                            message_count_assistant=0,
-                            message_count_total=msg_count,
-                            tool_call_count=0,
-                            tokens=TokenUsage(),
-                            data_completeness="partial",
-                            is_pruned=True,
-                            cost_usd=None,
-                            started_at=created,
-                            ended_at=modified,
-                            duration_seconds=duration,
-                        ))
+                        results.append(parser.session_from_snapshot({
+                            "id": _make_session_id(Harness.CLAUDE, source_id),
+                            "source_session_id": source_id,
+                            "harness_version": None,
+                            "project_name": idx_project,
+                            "git_repo_name": idx_project,
+                            "git_branch": entry.get("gitBranch"),
+                            "model": "unknown",
+                            "provider": "anthropic",
+                            "message_count_user": 0,
+                            "message_count_assistant": 0,
+                            "message_count_total": msg_count,
+                            "tool_call_count": 0,
+                            "tokens": TokenUsage(),
+                            "data_completeness": "partial",
+                            "is_pruned": True,
+                            "started_at": created,
+                            "ended_at": modified,
+                            "duration_seconds": duration,
+                        }))
                         seen_session_ids.add(source_id)
                 except Exception:
                     continue
@@ -169,7 +220,7 @@ def _parse_claude(
     # Most complete record of prompt counts, even when JSONL files are pruned.
     # We dedup against JSONL sessions using text[:100] + 5s-bucketed timestamp
     # as a shared key — only prompts NOT already seen in JSONL are counted.
-    history_file = Path.home() / ".claude" / "history.jsonl"
+    history_file = paths.history_path
     if history_file.is_file():
         # Group unseen history prompts by project
         history_new: dict[str, list[int]] = {}  # project → [ts_ms, ...]
@@ -216,33 +267,31 @@ def _parse_claude(
             source_id = f"history-supplement-{proj_name}"
             if source_id in seen_session_ids:
                 continue
-            results.append(SessionMeta(
-                id=_make_session_id(Harness.CLAUDE, source_id),
-                source_session_id=source_id,
-                harness=Harness.CLAUDE,
-                harness_version=None,
-                project_name=proj_name,
-                git_repo_name=proj_name,
-                git_branch=None,
-                model="unknown",
-                provider="anthropic",
-                message_count_user=len(timestamps),
-                message_count_assistant=0,
-                message_count_total=len(timestamps),
-                tool_call_count=0,
-                tokens=TokenUsage(),
-                data_completeness="prompts_only",
-                is_pruned=True,
-                cost_usd=None,
-                started_at=f"{first_day}T00:00:00Z",
-                ended_at=f"{last_day}T23:59:59Z",
-                duration_seconds=None,
-            ))
+            results.append(parser.session_from_snapshot({
+                "id": _make_session_id(Harness.CLAUDE, source_id),
+                "source_session_id": source_id,
+                "harness_version": None,
+                "project_name": proj_name,
+                "git_repo_name": proj_name,
+                "git_branch": None,
+                "model": "unknown",
+                "provider": "anthropic",
+                "message_count_user": len(timestamps),
+                "message_count_assistant": 0,
+                "message_count_total": len(timestamps),
+                "tool_call_count": 0,
+                "tokens": TokenUsage(),
+                "data_completeness": "prompts_only",
+                "is_pruned": True,
+                "started_at": f"{first_day}T00:00:00Z",
+                "ended_at": f"{last_day}T23:59:59Z",
+                "duration_seconds": None,
+            }))
             seen_session_ids.add(source_id)
 
     # --- Source 2: Session metadata in Application Support (fallback) ---
     for sessions_dir in [
-        Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions",
+        paths.app_sessions_dir,
         Path.home() / ".config" / "Claude" / "claude-code-sessions",
     ]:
         if not sessions_dir.is_dir():
@@ -276,26 +325,24 @@ def _parse_claude(
                 if created_ms and last_ms:
                     duration = max(0, int((last_ms - created_ms) / 1000))
 
-                results.append(SessionMeta(
-                    id=_make_session_id(Harness.CLAUDE, source_id),
-                    source_session_id=source_id,
-                    harness=Harness.CLAUDE,
-                    harness_version=None,
-                    project_name=_basename_only(data.get("cwd") or data.get("originCwd")),
-                    git_repo_name=None,
-                    git_branch=None,
-                    model=data.get("model", "unknown"),
-                    provider="anthropic",
-                    message_count_user=0,
-                    message_count_assistant=0,
-                    message_count_total=0,
-                    tool_call_count=0,
-                    tokens=TokenUsage(),
-                    cost_usd=None,
-                    started_at=started_at,
-                    ended_at=ended_at,
-                    duration_seconds=duration,
-                ))
+                results.append(parser.session_from_snapshot({
+                    "id": _make_session_id(Harness.CLAUDE, source_id),
+                    "source_session_id": source_id,
+                    "harness_version": None,
+                    "project_name": _basename_only(data.get("cwd") or data.get("originCwd")),
+                    "git_repo_name": None,
+                    "git_branch": None,
+                    "model": data.get("model", "unknown"),
+                    "provider": "anthropic",
+                    "message_count_user": 0,
+                    "message_count_assistant": 0,
+                    "message_count_total": 0,
+                    "tool_call_count": 0,
+                    "tokens": TokenUsage(),
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_seconds": duration,
+                }))
                 seen_session_ids.add(source_id)
             except Exception:
                 continue
@@ -325,6 +372,10 @@ def _parse_claude_jsonl(
     total_count = 0
     tool_call_count = 0
     subagent_calls = 0
+    # Execution time tracking: measure harness work time between user prompts
+    turn_exec_times: list[float] = []
+    _last_user_ts: datetime | None = None
+    _last_nonuser_ts: datetime | None = None
     background_agents = 0
     mcp_calls = 0
     plan_mode_entries = 0
@@ -335,6 +386,7 @@ def _parse_claude_jsonl(
     cache_write = 0
     tool_names: Counter = Counter()
     skill_invocations: Counter = Counter()  # skill name → count
+    mcp_servers: dict[str, dict] = {}
     first_ts: Optional[str] = None
     last_ts: Optional[str] = None
     cwd: Optional[str] = None
@@ -374,6 +426,21 @@ def _parse_claude_jsonl(
                     last_ts = timestamp
 
             if entry_type == "user":
+                # Track execution time: gap from user prompt to last response
+                if _last_user_ts and _last_nonuser_ts and timestamp:
+                    try:
+                        exec_time = (_last_nonuser_ts - _last_user_ts).total_seconds()
+                        if 0 < exec_time < 1800:  # cap at 30min (idle = user walked away)
+                            turn_exec_times.append(exec_time)
+                    except (TypeError, ValueError):
+                        pass
+                if timestamp:
+                    try:
+                        _last_user_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                _last_nonuser_ts = None
+
                 user_count += 1
                 total_count += 1
                 v = entry.get("version")
@@ -397,6 +464,11 @@ def _parse_claude_jsonl(
                         pass
 
             elif entry_type == "assistant":
+                if timestamp:
+                    try:
+                        _last_nonuser_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
                 assistant_count += 1
                 total_count += 1
                 msg = entry.get("message", {})
@@ -447,6 +519,7 @@ def _parse_claude_jsonl(
                                 skill_invocations[c["skill_name"]] += 1
                             if c["is_mcp"]:
                                 mcp_calls += 1
+                                _register_mcp_tool(mcp_servers, tool_name)
                                 if date:
                                     _add_daily(date, mcp_calls=1)
                             if c["is_plan_enter"]:
@@ -471,6 +544,11 @@ def _parse_claude_jsonl(
                                     _add_daily(date, mcp_calls=1)
 
             elif entry_type == "system":
+                if timestamp:
+                    try:
+                        _last_nonuser_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
                 total_count += 1
                 # Detect marketplace plugins from hook summaries
                 # Plugin paths appear in hookInfos.command (may use ${CLAUDE_PLUGIN_ROOT})
@@ -553,10 +631,12 @@ def _parse_claude_jsonl(
                                         c = parser.classify_tool_call(tool_name, ti)
                                         if c["is_mcp"]:
                                             mcp_calls += 1
+                                            _register_mcp_tool(mcp_servers, tool_name)
                                             if date:
                                                 _add_daily(date, mcp_calls=1)
                                     elif tool_name.startswith("mcp__"):
                                         mcp_calls += 1
+                                        _register_mcp_tool(mcp_servers, tool_name)
                                         if date:
                                             _add_daily(date, mcp_calls=1)
                         elif entry_type == "user":
@@ -617,6 +697,15 @@ def _parse_claude_jsonl(
         except ValueError:
             pass
 
+    # Capture last turn execution time (user → end of session)
+    if _last_user_ts and _last_nonuser_ts:
+        try:
+            exec_time = (_last_nonuser_ts - _last_user_ts).total_seconds()
+            if 0 < exec_time < 1800:
+                turn_exec_times.append(exec_time)
+        except (TypeError, ValueError):
+            pass
+
     total_tokens = input_tokens + output_tokens
 
     tool_summaries = tuple(
@@ -638,10 +727,6 @@ def _parse_claude_jsonl(
         skills[skill_name] = {"count": count, "source": source}
 
     # Compute intervention_rate: user prompts / tool calls (lower = more autonomous)
-    intervention = None
-    if tool_call_count > 0:
-        intervention = round(user_count / tool_call_count, 2)
-
     # Mark first date as having 1 session
     if first_ts:
         first_date = _get_date(first_ts)
@@ -650,38 +735,41 @@ def _parse_claude_jsonl(
 
     daily_list = sorted(daily_data.values(), key=lambda d: d["date"])
 
-    return SessionMeta(
-        id=_make_session_id(Harness.CLAUDE, session_id),
-        source_session_id=session_id,
-        harness=Harness.CLAUDE,
-        harness_version=harness_version,
-        project_name=project_name,
-        git_repo_name=project_name,
-        git_branch=None,
-        model=top_model,
-        provider="anthropic",
-        message_count_user=user_count,
-        message_count_assistant=assistant_count,
-        message_count_total=total_count,
-        tool_call_count=tool_call_count,
-        subagent_calls=subagent_calls,
-        background_agents=background_agents,
-        mcp_calls=mcp_calls,
-        plan_mode_entries=plan_mode_entries,
-        plan_mode_exits=plan_mode_exits,
-        tokens=TokenUsage(
+    return parser.session_from_snapshot({
+        "id": _make_session_id(Harness.CLAUDE, session_id),
+        "source_session_id": session_id,
+        "harness_version": harness_version,
+        "project_name": project_name,
+        "git_repo_name": project_name,
+        "git_branch": None,
+        "model": top_model,
+        "provider": "anthropic",
+        "message_count_user": user_count,
+        "message_count_assistant": assistant_count,
+        "message_count_total": total_count,
+        "tool_call_count": tool_call_count,
+        "subagent_calls": subagent_calls,
+        "background_agents": background_agents,
+        "mcp_calls": mcp_calls,
+        "mcp_servers": mcp_servers,
+        "plan_mode_entries": plan_mode_entries,
+        "plan_mode_exits": plan_mode_exits,
+        "tokens": TokenUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read,
             cache_write_tokens=cache_write,
             total_tokens=total_tokens,
         ),
-        tool_calls=tool_summaries,
-        skills_used=skills,
-        daily=daily_list,
-        cost_usd=None,
-        intervention_rate=intervention,
-        started_at=started_at,
-        ended_at=ended_at,
-        duration_seconds=duration,
-    ), prompt_keys
+        "tool_calls": tool_summaries,
+        "skills_used": skills,
+        "daily": daily_list,
+        "cost_usd": None,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": duration,
+        # Harness execution time derived from timestamp gaps
+        "total_exec_seconds": round(sum(turn_exec_times), 1) if turn_exec_times else None,
+        "mean_turn_seconds": round(sum(turn_exec_times) / len(turn_exec_times), 1) if turn_exec_times else None,
+        "median_turn_seconds": round(sorted(turn_exec_times)[len(turn_exec_times) // 2], 1) if turn_exec_times else None,
+    }), prompt_keys

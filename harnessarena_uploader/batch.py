@@ -13,6 +13,13 @@ from typing import Optional
 
 from ._version import __version__
 from .helpers import _machine_id, _utcnow_iso
+from .history_paths import (
+    get_claude_history_paths,
+    get_codex_history_paths,
+    get_cursor_history_paths,
+    get_gemini_history_paths,
+    get_opencode_history_paths,
+)
 from .models import Harness, HarnessMeta, SessionMeta, UploadBatch
 from .parsers import PARSERS
 
@@ -59,7 +66,7 @@ def _get_harness_version_from_history(harness: Harness) -> Optional[str]:
     """
     try:
         if harness == Harness.CODEX:
-            db_path = Path.home() / ".codex" / "state_5.sqlite"
+            db_path = get_codex_history_paths().state_db_path
             if db_path.exists():
                 db = sqlite3.connect(str(db_path))
                 row = db.execute(
@@ -70,7 +77,7 @@ def _get_harness_version_from_history(harness: Harness) -> Optional[str]:
                     return row[0]
 
         elif harness == Harness.OPENCODE:
-            db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+            db_path = get_opencode_history_paths().db_path
             if db_path.exists():
                 db = sqlite3.connect(str(db_path))
                 row = db.execute(
@@ -96,7 +103,7 @@ def _get_session_date_range(harness: Harness) -> tuple[Optional[str], Optional[s
 
     try:
         if harness == Harness.CLAUDE:
-            sessions_dir = Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+            sessions_dir = get_claude_history_paths().app_sessions_dir
             for f in sessions_dir.rglob("*.json"):
                 try:
                     d = json.loads(f.read_text())
@@ -108,7 +115,7 @@ def _get_session_date_range(harness: Harness) -> tuple[Optional[str], Optional[s
                     pass
 
         elif harness == Harness.GEMINI:
-            for f in Path.home().joinpath(".gemini", "tmp").rglob("chats/*.json"):
+            for f in get_gemini_history_paths().tmp_dir.rglob("chats/*.json"):
                 try:
                     d = json.loads(f.read_text())
                     for key in ("startTime", "lastUpdated"):
@@ -119,7 +126,7 @@ def _get_session_date_range(harness: Harness) -> tuple[Optional[str], Optional[s
                     pass
 
         elif harness == Harness.AGENT:
-            for db_path in Path.home().joinpath(".cursor", "chats").rglob("store.db"):
+            for db_path in get_cursor_history_paths().chats_dir.rglob("store.db"):
                 try:
                     db = sqlite3.connect(str(db_path))
                     meta_hex = db.execute("SELECT value FROM meta LIMIT 1").fetchone()[0]
@@ -154,7 +161,7 @@ def _get_version_range_from_history(harness: Harness) -> Optional[str]:
     versions: list[str] = []
     try:
         if harness == Harness.CODEX:
-            db_path = Path.home() / ".codex" / "state_5.sqlite"
+            db_path = get_codex_history_paths().state_db_path
             if db_path.exists():
                 db = sqlite3.connect(str(db_path))
                 rows = db.execute("SELECT DISTINCT cli_version FROM threads WHERE cli_version IS NOT NULL").fetchall()
@@ -162,7 +169,7 @@ def _get_version_range_from_history(harness: Harness) -> Optional[str]:
                 db.close()
 
         elif harness == Harness.OPENCODE:
-            db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+            db_path = get_opencode_history_paths().db_path
             if db_path.exists():
                 db = sqlite3.connect(str(db_path))
                 rows = db.execute("SELECT DISTINCT version FROM session WHERE version IS NOT NULL").fetchall()
@@ -218,7 +225,7 @@ def _collect_harness_meta(harness: Harness) -> HarnessMeta:
     # 3. Harness-specific extras
     if harness == Harness.CODEX:
         try:
-            db_path = Path.home() / ".codex" / "state_5.sqlite"
+            db_path = get_codex_history_paths().state_db_path
             if db_path.exists():
                 db = sqlite3.connect(str(db_path))
                 row = db.execute(
@@ -233,7 +240,7 @@ def _collect_harness_meta(harness: Harness) -> HarnessMeta:
 
     elif harness == Harness.OPENCODE:
         try:
-            pkg = Path.home() / ".config" / "opencode" / "package.json"
+            pkg = get_opencode_history_paths().package_json_path
             if pkg.exists():
                 data = json.loads(pkg.read_text())
                 plugin_version = data.get("dependencies", {}).get("@opencode-ai/plugin")
@@ -350,3 +357,26 @@ def serialize_batch(batch: UploadBatch) -> dict:
     for s in result["sessions"]:
         s["harness"] = s["harness"] if isinstance(s["harness"], str) else s["harness"]
     return result
+
+
+def list_projects(batch: UploadBatch) -> list[tuple[str, tuple[Harness, ...], int]]:
+    """Return unique projects in a batch with harness coverage and session counts."""
+    projects: dict[str, dict[str, object]] = {}
+    for session in batch.sessions:
+        if not session.project_name:
+            continue
+        entry = projects.setdefault(
+            session.project_name,
+            {"harnesses": set(), "session_count": 0},
+        )
+        harnesses = entry["harnesses"]
+        if isinstance(harnesses, set):
+            harnesses.add(session.harness)
+        entry["session_count"] = int(entry["session_count"]) + 1
+
+    rows: list[tuple[str, tuple[Harness, ...], int]] = []
+    for project_name, entry in sorted(projects.items()):
+        harnesses = tuple(sorted(entry["harnesses"], key=lambda h: h.value))
+        session_count = int(entry["session_count"])
+        rows.append((project_name, harnesses, session_count))
+    return rows

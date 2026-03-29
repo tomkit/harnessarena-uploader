@@ -16,8 +16,10 @@ paths. Only aggregated metadata (counts, durations, model names, token totals)
 leaves the machine. The entire tool is a single file so users can audit it.
 
 Usage:
-    python harnessarena_uploader.py [--harness claude|gemini|codex|agent|opencode|all]
+    python harnessarena_uploader.py [--harness claude|gemini|codex|agent|opencode|all]...
                                     [--since YYYY-MM-DD]
+                                    [--list-projects]
+                                    [--no-wizard]
                                     [--dry-run]
                                     [--api-key KEY]
                                     [--api-url URL]
@@ -26,10 +28,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import os
 import platform
+import shutil
 import sqlite3
 import sys
 import uuid
@@ -216,6 +220,14 @@ class SessionMeta:
 
     # --- Cost ---------------------------------------------------------------
     cost_usd: Optional[float] = None
+
+    # --- Data completeness ----------------------------------------------------
+    # Describes what data source this session was recovered from:
+    #   "full"    — parsed from the primary session history
+    #   "partial" — recovered from lightweight metadata/index only
+    #   "prompts_only" — recovered only from prompt history supplement
+    data_completeness: str = "full"
+    is_pruned: bool = False
 
     # --- Derived metrics ----------------------------------------------------
     intervention_rate: Optional[float] = None  # user prompts / tool calls
@@ -587,6 +599,8 @@ def _parse_claude(
                             tool_call_count=0,
                             tokens=TokenUsage(),
                             cost_usd=None,
+                            data_completeness="partial",
+                            is_pruned=True,
                             started_at=created,
                             ended_at=modified,
                             duration_seconds=duration,
@@ -663,6 +677,8 @@ def _parse_claude(
                 tool_call_count=0,
                 tokens=TokenUsage(),
                 cost_usd=None,
+                data_completeness="prompts_only",
+                is_pruned=True,
                 started_at=f"{first_day}T00:00:00Z",
                 ended_at=f"{last_day}T23:59:59Z",
                 duration_seconds=None,
@@ -721,6 +737,8 @@ def _parse_claude(
                     tool_call_count=0,
                     tokens=TokenUsage(),
                     cost_usd=None,
+                    data_completeness="partial",
+                    is_pruned=True,
                     started_at=started_at,
                     ended_at=ended_at,
                     duration_seconds=duration,
@@ -2189,6 +2207,386 @@ def serialize_batch(batch: UploadBatch) -> dict:
     return result
 
 
+def _summarize_completeness(levels: set[str]) -> str:
+    order = ("full", "partial", "prompts_only")
+    present = [level for level in order if level in levels]
+    return "+".join(present) if present else "unknown"
+
+
+def list_projects(batch: UploadBatch) -> list[tuple[str, tuple[Harness, ...], int, str]]:
+    """Return unique projects with harness coverage, session counts, and completeness."""
+    projects: dict[str, dict[str, object]] = {}
+    for session in batch.sessions:
+        if not session.project_name:
+            continue
+        entry = projects.setdefault(
+            session.project_name,
+            {"harnesses": set(), "session_count": 0, "completeness": set()},
+        )
+        harnesses = entry["harnesses"]
+        if isinstance(harnesses, set):
+            harnesses.add(session.harness)
+        completeness = entry["completeness"]
+        if isinstance(completeness, set):
+            completeness.add(session.data_completeness or "full")
+        entry["session_count"] = int(entry["session_count"]) + 1
+
+    rows: list[tuple[str, tuple[Harness, ...], int, str]] = []
+    for project_name, entry in sorted(projects.items()):
+        harnesses = tuple(sorted(entry["harnesses"], key=lambda h: h.value))
+        session_count = int(entry["session_count"])
+        completeness_summary = _summarize_completeness(entry["completeness"])
+        rows.append((project_name, harnesses, session_count, completeness_summary))
+    return rows
+
+
+def _command_exists(binary: str) -> bool:
+    return shutil.which(binary) is not None
+
+
+def _detect_harness_installed(harness: Harness) -> bool:
+    home = Path.home()
+    if harness == Harness.CLAUDE:
+        return _command_exists("claude") or (home / ".claude").exists()
+    if harness == Harness.GEMINI:
+        return _command_exists("gemini") or (home / ".gemini").exists()
+    if harness == Harness.CODEX:
+        return _command_exists("codex") or (home / ".codex").exists()
+    if harness == Harness.AGENT:
+        return _command_exists("agent") or (home / ".cursor" / "chats").exists()
+    if harness == Harness.OPENCODE:
+        return _command_exists("opencode") or (home / ".local" / "share" / "opencode" / "opencode.db").exists()
+    return False
+
+
+def _parse_index_selection(text: str, max_index: int) -> list[int]:
+    value = text.strip().lower()
+    if not value or value == "all":
+        return list(range(1, max_index + 1))
+    selected: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if start > end:
+                start, end = end, start
+            for idx in range(start, end + 1):
+                if idx < 1 or idx > max_index:
+                    raise ValueError(f"Selection '{part}' is out of range 1-{max_index}")
+                selected.add(idx)
+        else:
+            idx = int(part)
+            if idx < 1 or idx > max_index:
+                raise ValueError(f"Selection '{part}' is out of range 1-{max_index}")
+            selected.add(idx)
+    return sorted(selected)
+
+
+def _run_multiselect_picker(
+    title: str,
+    lines: list[str],
+    selected_default: set[int],
+    footer: str,
+    header_lines: Optional[list[str]] = None,
+) -> Optional[list[int]]:
+    try:
+        import curses
+    except Exception:
+        return None
+
+    def _picker(stdscr):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        current = 0
+        offset = 0
+        selected = set(selected_default)
+
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            header_count = len(header_lines or [])
+            usable_height = max(1, height - (4 + header_count))
+            if current < offset:
+                offset = current
+            elif current >= offset + usable_height:
+                offset = current - usable_height + 1
+
+            stdscr.addnstr(0, 0, title, width - 1, curses.A_BOLD)
+            stdscr.addnstr(1, 0, footer, width - 1)
+            for idx, line in enumerate(header_lines or []):
+                stdscr.addnstr(idx + 3, 0, line, width - 1, curses.A_DIM)
+
+            visible = lines[offset:offset + usable_height]
+            for idx, line in enumerate(visible):
+                actual_idx = offset + idx
+                marker = "[x]" if actual_idx in selected else "[ ]"
+                row = f"{marker} {line}"
+                attr = curses.A_REVERSE if actual_idx == current else curses.A_NORMAL
+                stdscr.addnstr(idx + 3 + header_count, 0, row, width - 1, attr)
+
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (curses.KEY_UP, ord("k")):
+                current = max(0, current - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                current = min(len(lines) - 1, current + 1)
+            elif ch == curses.KEY_NPAGE:
+                current = min(len(lines) - 1, current + usable_height)
+            elif ch == curses.KEY_PPAGE:
+                current = max(0, current - usable_height)
+            elif ch == ord(" "):
+                if current in selected:
+                    selected.remove(current)
+                else:
+                    selected.add(current)
+            elif ch in (ord("a"), ord("A")):
+                if len(selected) == len(lines):
+                    selected.clear()
+                else:
+                    selected = set(range(len(lines)))
+            elif ch in (10, 13, curses.KEY_ENTER):
+                return sorted(selected)
+            elif ch in (27, ord("q")):
+                return []
+
+    try:
+        result = curses.wrapper(_picker)
+    except Exception:
+        return None
+    return result
+
+
+def _fallback_select_indexes(prompt: str, max_index: int, default_indexes: list[int]) -> list[int]:
+    default_text = ",".join(str(i) for i in default_indexes) if default_indexes else "all"
+    while True:
+        raw = input(f"{prompt} [default: {default_text}]: ").strip()
+        if not raw:
+            raw = default_text
+        try:
+            return _parse_index_selection(raw, max_index)
+        except ValueError as e:
+            print(f"Invalid selection: {e}")
+
+
+def _prompt_select_harnesses() -> list[Harness]:
+    detected = {h: _detect_harness_installed(h) for h in Harness}
+    all_harnesses = list(Harness)
+    lines = [
+        f"{idx + 1:>2}. {h.value:<8}  {'installed' if detected[h] else 'not detected'}"
+        for idx, h in enumerate(all_harnesses)
+    ]
+    default = [idx + 1 for idx, harness in enumerate(all_harnesses) if detected[harness]]
+    picked = _run_multiselect_picker(
+        "Select harnesses to scan",
+        lines,
+        {i - 1 for i in default},
+        "Arrow keys move, space toggles, a toggles all, enter confirms, q cancels.",
+    )
+    if picked == []:
+        return []
+    if picked is None:
+        indexes = _fallback_select_indexes("Choose harnesses", len(all_harnesses), default)
+    else:
+        indexes = [idx + 1 for idx in picked] if picked else default or list(range(1, len(all_harnesses) + 1))
+    seen: set[Harness] = set()
+    result: list[Harness] = []
+    for idx in indexes:
+        harness = all_harnesses[idx - 1]
+        if harness not in seen:
+            seen.add(harness)
+            result.append(harness)
+    return result
+
+
+def _clone_batch(batch: UploadBatch, sessions: list[SessionMeta]) -> Optional[UploadBatch]:
+    if not sessions:
+        return None
+    return UploadBatch(
+        id=str(uuid.uuid4()),
+        tool_version=batch.tool_version,
+        harnesses_scanned=batch.harnesses_scanned,
+        harness_meta=batch.harness_meta,
+        sessions=tuple(sessions),
+        machine_id=batch.machine_id,
+        created_at=_utcnow_iso(),
+    )
+
+
+def _filter_batch_projects(
+    batch: UploadBatch,
+    selected_projects: set[str],
+    project_aliases: Optional[dict[str, str]] = None,
+) -> Optional[UploadBatch]:
+    sessions = [s for s in batch.sessions if s.project_name in selected_projects]
+    if project_aliases:
+        sessions = [_apply_aliases(s, project_aliases) for s in sessions]
+    return _clone_batch(batch, sessions)
+
+
+def _prompt_select_projects(batch: UploadBatch) -> Optional[set[str]]:
+    rows = list_projects(batch)
+    if not rows:
+        return set()
+    projects = [project_name for project_name, _, _, _ in rows]
+    table_lines = _format_project_rows(rows)
+    body_lines = table_lines[2:]
+    picked = _run_multiselect_picker(
+        "Select projects to include",
+        body_lines,
+        set(range(len(body_lines))),
+        "Arrow keys move, space toggles, a toggles all, enter confirms, q cancels.",
+        header_lines=table_lines[:2],
+    )
+    if picked == []:
+        return None
+    if picked is None:
+        print("")
+        for line in table_lines:
+            print(line)
+        indexes = _fallback_select_indexes("Choose projects to include", len(projects), list(range(1, len(projects) + 1)))
+    else:
+        indexes = [idx + 1 for idx in picked] if picked else list(range(1, len(projects) + 1))
+    return {projects[idx - 1] for idx in indexes}
+
+
+def _prompt_project_aliases(selected_projects: set[str]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    if not selected_projects:
+        return aliases
+    answer = input("Combine selected projects under aliases? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes"}:
+        return aliases
+    print("\nSelected projects:")
+    for name in sorted(selected_projects):
+        print(f"  - {name}")
+    print("\nEnter alias mappings as SOURCE=TARGET. TARGET may be an existing project name or a new combined name.")
+    print("Press Enter on a blank line when done.")
+    while True:
+        raw = input("Alias mapping: ").strip()
+        if not raw:
+            return aliases
+        if "=" not in raw:
+            print("Expected SOURCE=TARGET")
+            continue
+        source, target = [part.strip() for part in raw.split("=", 1)]
+        if not source or not target:
+            print("Both SOURCE and TARGET are required")
+            continue
+        if source not in selected_projects:
+            print(f"Unknown selected project: {source}")
+            continue
+        aliases[source] = target
+
+
+def _prompt_confirm_upload(batch: UploadBatch, api_url: str) -> bool:
+    rows = list_projects(batch)
+    project_count = len(rows)
+    response = input(
+        f"Upload {batch.session_count} sessions across {project_count} projects to {api_url}? [Y/n]: "
+    ).strip().lower()
+    return response in {"", "y", "yes"}
+
+
+def _run_interactive_wizard(args: argparse.Namespace) -> int:
+    print(f"harnessarena-uploader v{__version__}")
+    harnesses = _prompt_select_harnesses()
+    if not harnesses:
+        print("Wizard canceled.")
+        return 0
+    print(f"\nScanning: {', '.join(h.value for h in harnesses)}", file=sys.stderr)
+    batch = build_batch(harnesses, since=args.since_dt, project_aliases=None)
+    if batch is None:
+        print("No sessions found.", file=sys.stderr)
+        return 0
+
+    selected_projects = _prompt_select_projects(batch)
+    if selected_projects is None:
+        print("Wizard canceled.")
+        return 0
+    if not selected_projects:
+        print("No named projects found.", file=sys.stderr)
+        return 0
+
+    project_aliases = _prompt_project_aliases(selected_projects)
+    filtered_batch = _filter_batch_projects(batch, selected_projects, project_aliases=project_aliases)
+    if filtered_batch is None:
+        print("No sessions left after project selection.", file=sys.stderr)
+        return 0
+
+    print("\nFinal selection:\n")
+    for line in _format_project_rows(list_projects(filtered_batch)):
+        print(line)
+
+    if not args.api_key:
+        args.api_key = getpass.getpass("\nHarness Arena API key: ").strip()
+
+    if not args.api_key:
+        print("Error: API key is required to upload.", file=sys.stderr)
+        return 1
+
+    if not _prompt_confirm_upload(filtered_batch, args.api_url):
+        print("Upload canceled.")
+        return 0
+
+    success = upload_batch(filtered_batch, args.api_url, args.api_key)
+    return 0 if success else 1
+
+
+def _should_run_wizard(args: argparse.Namespace) -> bool:
+    if args.no_wizard:
+        return False
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return False
+    if args.harness or args.list_projects or args.alias or args.dry_run or args.since:
+        return False
+    return True
+
+
+def _format_project_rows(rows: list[tuple[str, tuple[Harness, ...], int, str]]) -> list[str]:
+    """Render project rows as an aligned terminal table."""
+    headers = ("PROJECT", "HARNESSES", "SESSIONS", "COMPLETENESS")
+    data = [
+        (
+            project_name,
+            ", ".join(h.value for h in harnesses),
+            str(session_count),
+            completeness,
+        )
+        for project_name, harnesses, session_count, completeness in rows
+    ]
+    widths = [len(header) for header in headers]
+    for row in data:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
+
+    lines = [
+        (
+            f"{headers[0]:<{widths[0]}}  "
+            f"{headers[1]:<{widths[1]}}  "
+            f"{headers[2]:>{widths[2]}}  "
+            f"{headers[3]:<{widths[3]}}"
+        ),
+        (
+            f"{'-' * widths[0]}  "
+            f"{'-' * widths[1]}  "
+            f"{'-' * widths[2]}  "
+            f"{'-' * widths[3]}"
+        ),
+    ]
+    for project_name, harnesses, session_count, completeness in data:
+        lines.append(
+            f"{project_name:<{widths[0]}}  "
+            f"{harnesses:<{widths[1]}}  "
+            f"{session_count:>{widths[2]}}  "
+            f"{completeness:<{widths[3]}}"
+        )
+    return lines
+
+
 def upload_batch(batch: UploadBatch, api_url: str, api_key: str) -> bool:
     """Upload batch to harnessarena.com API.
 
@@ -2235,9 +2633,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--harness",
+        action="append",
         choices=["claude", "gemini", "codex", "agent", "opencode", "all"],
-        default="all",
-        help="Which harness to scan (default: all)",
+        default=[],
+        help="Which harnesses to scan. Can repeat. Default: all.",
     )
     parser.add_argument(
         "--since",
@@ -2267,7 +2666,17 @@ def main() -> int:
         action="append",
         metavar="OLD=NEW",
         default=[],
-        help="Rename a project in output (e.g. --alias speeding-ticket-fighter=ticketfight-ai). Can repeat.",
+        help="Fold one project name into another in output (e.g. --alias speeding-ticket-fighter=ticketfight-ai). Can repeat.",
+    )
+    parser.add_argument(
+        "--list-projects",
+        action="store_true",
+        help="List unique projects found in the selected harnesses and exit.",
+    )
+    parser.add_argument(
+        "--no-wizard",
+        action="store_true",
+        help="Disable the interactive wizard and use flag-driven mode.",
     )
     parser.add_argument(
         "--version",
@@ -2286,10 +2695,16 @@ def main() -> int:
         project_aliases[old.strip()] = new.strip()
 
     # Resolve harnesses
-    if args.harness == "all":
+    if not args.harness or "all" in args.harness:
         harnesses = list(Harness)
     else:
-        harnesses = [Harness(args.harness)]
+        seen: set[Harness] = set()
+        harnesses = []
+        for harness_name in args.harness:
+            harness = Harness(harness_name)
+            if harness not in seen:
+                seen.add(harness)
+                harnesses.append(harness)
 
     # Parse --since
     since = None
@@ -2299,6 +2714,10 @@ def main() -> int:
         except ValueError:
             print(f"Error: --since must be YYYY-MM-DD, got '{args.since}'", file=sys.stderr)
             return 1
+    args.since_dt = since
+
+    if _should_run_wizard(args):
+        return _run_interactive_wizard(args)
 
     print(f"harnessarena-uploader v{__version__}", file=sys.stderr)
     print(f"Scanning: {', '.join(h.value for h in harnesses)}", file=sys.stderr)
@@ -2307,6 +2726,15 @@ def main() -> int:
 
     if batch is None:
         print("No sessions found.", file=sys.stderr)
+        return 0
+
+    if args.list_projects:
+        projects = list_projects(batch)
+        if not projects:
+            print("No named projects found.")
+            return 0
+        for line in _format_project_rows(projects):
+            print(line)
         return 0
 
     print(f"\nBatch {batch.id}:", file=sys.stderr)

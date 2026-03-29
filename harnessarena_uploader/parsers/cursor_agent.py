@@ -7,6 +7,20 @@ from pathlib import Path
 from typing import Optional
 
 from ..base_parser import HarnessParser
+from ..history_paths import get_cursor_history_paths
+from ..metric_strategies import (
+    ConstantSessionsMetricStrategy,
+    HarnessMetricStrategies,
+    SnapshotCostMetricStrategy,
+    SnapshotDailyMetricStrategy,
+    SnapshotMCPMetricStrategy,
+    SnapshotPlanMetricStrategy,
+    SnapshotPromptMetricStrategy,
+    SnapshotSkillMetricStrategy,
+    SnapshotSubagentMetricStrategy,
+    SnapshotTokenMetricStrategy,
+    SnapshotToolMetricStrategy,
+)
 from ..helpers import _make_session_id
 from ..models import Harness, SessionMeta, TokenUsage, ToolCallSummary
 
@@ -21,11 +35,55 @@ class CursorAgentParser(HarnessParser):
 
     harness_type = Harness.AGENT
 
+    def __init__(self) -> None:
+        self._paths = get_cursor_history_paths()
+        self._strategies = HarnessMetricStrategies(
+            sessions=ConstantSessionsMetricStrategy(),
+            prompts=SnapshotPromptMetricStrategy(),
+            subagents=SnapshotSubagentMetricStrategy(),
+            mcp=SnapshotMCPMetricStrategy(),
+            skills=SnapshotSkillMetricStrategy(),
+            tools=SnapshotToolMetricStrategy(),
+            tokens=SnapshotTokenMetricStrategy(),
+            plan=SnapshotPlanMetricStrategy(),
+            daily=SnapshotDailyMetricStrategy(),
+            cost=SnapshotCostMetricStrategy(),
+        )
+
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
-        return _parse_cursor_agent(since, parser=self)
+        return _parse_cursor_agent(since, parser=self, paths=self._paths)
+
+    def metric_strategies(self) -> HarnessMetricStrategies:
+        return self._strategies
 
 
-def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[HarnessParser] = None) -> list[SessionMeta]:
+def _register_mcp_tool(mcp_servers: dict[str, dict], tool_name: str) -> None:
+    if not tool_name.startswith("mcp__"):
+        return
+    remainder = tool_name[len("mcp__") :]
+    server_name = remainder
+    primitive_name = tool_name
+    if "__" in remainder:
+        server_name, primitive_name = remainder.split("__", 1)
+    elif "_" in remainder:
+        server_name, primitive_name = remainder.split("_", 1)
+    server = mcp_servers.setdefault(
+        server_name,
+        {"invocation_count": 0, "uri": None, "primitives": {}},
+    )
+    server["invocation_count"] += 1
+    primitive = server["primitives"].setdefault(
+        primitive_name,
+        {"primitive_type": "tool", "invocation_count": 0},
+    )
+    primitive["invocation_count"] += 1
+
+
+def _parse_cursor_agent(
+    since: Optional[datetime] = None,
+    parser: Optional[HarnessParser] = None,
+    paths=None,
+) -> list[SessionMeta]:
     """Parse Cursor Agent SQLite databases.
 
     Path: ~/.cursor/chats/{hash}/{uuid}/store.db
@@ -33,7 +91,8 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
     lastUsedModel, createdAt.
     Blobs table has message bytes: {role, content: [{type, toolName, ...}]}
     """
-    cursor_dir = Path.home() / ".cursor" / "chats"
+    paths = paths or get_cursor_history_paths()
+    cursor_dir = paths.chats_dir
     if not cursor_dir.is_dir():
         return []
 
@@ -121,6 +180,7 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                 plan_mode_exits = 0
                 estimated_input_tokens = 0
                 estimated_output_tokens = 0
+                mcp_servers: dict[str, dict] = {}
 
                 try:
                     db_cursor.execute("SELECT data FROM blobs")
@@ -179,10 +239,11 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                                         c = parser.classify_tool_call(tool_name, tool_input)
                                         if c["is_subagent"]:
                                             subagent_calls += 1
-                                            if c["is_background_agent"]:
-                                                background_agents += 1
+                                        if c["is_background_agent"]:
+                                            background_agents += 1
                                         if c["is_mcp"]:
                                             mcp_calls += 1
+                                            _register_mcp_tool(mcp_servers, tool_name)
                                         if c["is_plan_enter"]:
                                             plan_mode_entries += 1
                                         if c["is_plan_exit"]:
@@ -201,35 +262,35 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                     except (ValueError, OSError):
                         started_at = str(created_at)
 
-                results.append(SessionMeta(
-                    id=_make_session_id(Harness.AGENT, source_id),
-                    source_session_id=source_id,
-                    harness=Harness.AGENT,
-                    harness_version=None,
-                    project_name=None,
-                    git_repo_name=None,
-                    git_branch=None,
-                    model=model,
-                    provider="cursor",
-                    message_count_user=user_count,
-                    message_count_assistant=assistant_count,
-                    message_count_total=total_count,
-                    tool_call_count=tool_call_count,
-                    subagent_calls=subagent_calls,
-                    background_agents=background_agents,
-                    mcp_calls=mcp_calls,
-                    plan_mode_entries=max(int(is_plan_mode), plan_mode_entries),
-                    plan_mode_exits=max(int(is_plan_mode), plan_mode_exits),
-                    tokens=TokenUsage(
+                results.append(parser.session_from_snapshot({
+                    "id": _make_session_id(Harness.AGENT, source_id),
+                    "source_session_id": source_id,
+                    "harness_version": None,
+                    "project_name": None,
+                    "git_repo_name": None,
+                    "git_branch": None,
+                    "model": model,
+                    "provider": "cursor",
+                    "message_count_user": user_count,
+                    "message_count_assistant": assistant_count,
+                    "message_count_total": total_count,
+                    "tool_call_count": tool_call_count,
+                    "subagent_calls": subagent_calls,
+                    "background_agents": background_agents,
+                    "mcp_calls": mcp_calls,
+                    "mcp_servers": mcp_servers,
+                    "plan_mode_entries": max(int(is_plan_mode), plan_mode_entries),
+                    "plan_mode_exits": max(int(is_plan_mode), plan_mode_exits),
+                    "tokens": TokenUsage(
                         input_tokens=estimated_input_tokens,
                         output_tokens=estimated_output_tokens,
                         total_tokens=estimated_input_tokens + estimated_output_tokens,
                     ),
-                    tool_calls=tuple(
+                    "tool_calls": tuple(
                         ToolCallSummary(n, c) for n, c in sorted(tool_names.items())
                     ),
-                    started_at=started_at,
-                ))
+                    "started_at": started_at,
+                }))
 
             except Exception as _exc:
                 continue

@@ -7,6 +7,20 @@ from pathlib import Path
 from typing import Optional
 
 from ..base_parser import HarnessParser
+from ..history_paths import get_opencode_history_paths
+from ..metric_strategies import (
+    ConstantSessionsMetricStrategy,
+    HarnessMetricStrategies,
+    SnapshotCostMetricStrategy,
+    SnapshotDailyMetricStrategy,
+    SnapshotMCPMetricStrategy,
+    SnapshotPlanMetricStrategy,
+    SnapshotPromptMetricStrategy,
+    SnapshotSkillMetricStrategy,
+    SnapshotSubagentMetricStrategy,
+    SnapshotTokenMetricStrategy,
+    SnapshotToolMetricStrategy,
+)
 from ..helpers import _basename_only, _make_session_id, _parse_timestamp, _safe_int
 from ..models import Harness, SessionMeta, TokenUsage, ToolCallSummary
 
@@ -20,11 +34,55 @@ class OpenCodeParser(HarnessParser):
 
     harness_type = Harness.OPENCODE
 
+    def __init__(self) -> None:
+        self._paths = get_opencode_history_paths()
+        self._strategies = HarnessMetricStrategies(
+            sessions=ConstantSessionsMetricStrategy(),
+            prompts=SnapshotPromptMetricStrategy(),
+            subagents=SnapshotSubagentMetricStrategy(),
+            mcp=SnapshotMCPMetricStrategy(),
+            skills=SnapshotSkillMetricStrategy(),
+            tools=SnapshotToolMetricStrategy(),
+            tokens=SnapshotTokenMetricStrategy(),
+            plan=SnapshotPlanMetricStrategy(),
+            daily=SnapshotDailyMetricStrategy(),
+            cost=SnapshotCostMetricStrategy(),
+        )
+
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
-        return _parse_opencode(since, parser=self)
+        return _parse_opencode(since, parser=self, paths=self._paths)
+
+    def metric_strategies(self) -> HarnessMetricStrategies:
+        return self._strategies
 
 
-def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessParser] = None) -> list[SessionMeta]:
+def _register_mcp_tool(mcp_servers: dict[str, dict], tool_name: str) -> None:
+    if not tool_name.startswith("mcp__"):
+        return
+    remainder = tool_name[len("mcp__") :]
+    server_name = remainder
+    primitive_name = tool_name
+    if "__" in remainder:
+        server_name, primitive_name = remainder.split("__", 1)
+    elif "_" in remainder:
+        server_name, primitive_name = remainder.split("_", 1)
+    server = mcp_servers.setdefault(
+        server_name,
+        {"invocation_count": 0, "uri": None, "primitives": {}},
+    )
+    server["invocation_count"] += 1
+    primitive = server["primitives"].setdefault(
+        primitive_name,
+        {"primitive_type": "tool", "invocation_count": 0},
+    )
+    primitive["invocation_count"] += 1
+
+
+def _parse_opencode(
+    since: Optional[datetime] = None,
+    parser: Optional[HarnessParser] = None,
+    paths=None,
+) -> list[SessionMeta]:
     """Parse OpenCode SQLite database.
 
     Path: ~/.local/share/opencode/opencode.db
@@ -33,7 +91,8 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
       message: id, session_id, data JSON with role/model/tokens/cost
       part: id, message_id, data JSON with type/text
     """
-    db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    paths = paths or get_opencode_history_paths()
+    db_path = paths.db_path
     if not db_path.is_file():
         return []
 
@@ -165,6 +224,7 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
             mcp_calls = 0
             plan_mode_entries = 0
             plan_mode_exits = 0
+            mcp_servers: dict[str, dict] = {}
             for part_row in cursor.fetchall():
                 try:
                     pdata = json.loads(part_row["data"]) if isinstance(part_row["data"], str) else {}
@@ -199,6 +259,7 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
                                 background_agents += 1
                         if c["is_mcp"]:
                             mcp_calls += 1
+                            _register_mcp_tool(mcp_servers, tool_name)
                         if c["is_plan_enter"]:
                             plan_mode_entries += 1
                         if c["is_plan_exit"]:
@@ -217,43 +278,43 @@ def _parse_opencode(since: Optional[datetime] = None, parser: Optional[HarnessPa
                 except ValueError:
                     pass
 
-            results.append(SessionMeta(
-                id=_make_session_id(Harness.OPENCODE, session_id),
-                source_session_id=session_id,
-                harness=Harness.OPENCODE,
-                harness_version=None,
-                project_name=project_name,
-                git_repo_name=project_name,
-                git_branch=None,
-                model=model,
-                provider=provider,
-                message_count_user=user_count,
-                message_count_assistant=assistant_count,
-                message_count_total=total_count,
-                tool_call_count=tool_call_count,
-                tokens=TokenUsage(
+            results.append(parser.session_from_snapshot({
+                "id": _make_session_id(Harness.OPENCODE, session_id),
+                "source_session_id": session_id,
+                "harness_version": None,
+                "project_name": project_name,
+                "git_repo_name": project_name,
+                "git_branch": None,
+                "model": model,
+                "provider": provider,
+                "message_count_user": user_count,
+                "message_count_assistant": assistant_count,
+                "message_count_total": total_count,
+                "tool_call_count": tool_call_count,
+                "tokens": TokenUsage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=input_tokens + output_tokens,
                 ),
-                subagent_calls=max(subagent_calls, spawn_counts.get(session_id, 0)),
-                background_agents=background_agents,
-                mcp_calls=mcp_calls,
-                plan_mode_entries=max(plan_entries, plan_mode_entries, int("plan" in agent_names)),
-                plan_mode_exits=max(plan_entries, plan_mode_exits, int("plan" in agent_names)),
-                tool_calls=tuple(
+                "subagent_calls": max(subagent_calls, spawn_counts.get(session_id, 0)),
+                "background_agents": background_agents,
+                "mcp_calls": mcp_calls,
+                "mcp_servers": mcp_servers,
+                "plan_mode_entries": max(plan_entries, plan_mode_entries, int("plan" in agent_names)),
+                "plan_mode_exits": max(plan_entries, plan_mode_exits, int("plan" in agent_names)),
+                "tool_calls": tuple(
                     ToolCallSummary(name, count)
                     for name, count in sorted(tool_counts.items())
                 ),
-                skills_used={
+                "skills_used": {
                     name: {"count": count, "source": "agent"}
                     for name, count in skill_invocations.items()
                 },
-                cost_usd=cost if cost > 0 else None,
-                started_at=started_at,
-                ended_at=ended_at if ended_at else None,
-                duration_seconds=duration,
-            ))
+                "cost_usd": cost if cost > 0 else None,
+                "started_at": started_at,
+                "ended_at": ended_at if ended_at else None,
+                "duration_seconds": duration,
+            }))
 
         conn.close()
     except sqlite3.Error:

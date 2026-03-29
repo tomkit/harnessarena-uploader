@@ -3,10 +3,23 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from ..base_parser import HarnessParser
+from ..history_paths import get_codex_history_paths
+from ..metric_strategies import (
+    ConstantSessionsMetricStrategy,
+    HarnessMetricStrategies,
+    SnapshotCostMetricStrategy,
+    SnapshotDailyMetricStrategy,
+    SnapshotMCPMetricStrategy,
+    SnapshotPlanMetricStrategy,
+    SnapshotPromptMetricStrategy,
+    SnapshotSkillMetricStrategy,
+    SnapshotSubagentMetricStrategy,
+    SnapshotTokenMetricStrategy,
+    SnapshotToolMetricStrategy,
+)
 from ..helpers import _basename_only, _make_session_id, _parse_timestamp, _safe_int
 from ..models import Harness, SessionMeta, TokenUsage, ToolCallSummary
 
@@ -24,9 +37,10 @@ class CodexParser(HarnessParser):
     harness_type = Harness.CODEX
 
     def __init__(self) -> None:
+        self._paths = get_codex_history_paths()
         # Build plugin registry from config.toml
         self._plugin_names: set[str] = set()
-        config_path = Path.home() / ".codex" / "config.toml"
+        config_path = self._paths.config_path
         if config_path.is_file():
             try:
                 with open(config_path, "r") as f:
@@ -39,6 +53,18 @@ class CodexParser(HarnessParser):
                                 self._plugin_names.add(name.split("@")[0])
             except OSError:
                 pass
+        self._strategies = HarnessMetricStrategies(
+            sessions=ConstantSessionsMetricStrategy(),
+            prompts=SnapshotPromptMetricStrategy(),
+            subagents=SnapshotSubagentMetricStrategy(),
+            mcp=SnapshotMCPMetricStrategy(),
+            skills=SnapshotSkillMetricStrategy(),
+            tools=SnapshotToolMetricStrategy(),
+            tokens=SnapshotTokenMetricStrategy(),
+            plan=SnapshotPlanMetricStrategy(),
+            daily=SnapshotDailyMetricStrategy(),
+            cost=SnapshotCostMetricStrategy(),
+        )
 
     def detect_skill(self, tool_name: str, tool_input: dict) -> Optional[str]:
         # Codex plugin tools appear as mcp__codex_apps__<plugin>_<action>
@@ -54,6 +80,31 @@ class CodexParser(HarnessParser):
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
         return _parse_codex(since, parser=self)
 
+    def metric_strategies(self) -> HarnessMetricStrategies:
+        return self._strategies
+
+
+def _register_mcp_tool(mcp_servers: dict[str, dict], tool_name: str) -> None:
+    if not tool_name.startswith("mcp__"):
+        return
+    remainder = tool_name[len("mcp__") :]
+    server_name = remainder
+    primitive_name = tool_name
+    if "__" in remainder:
+        server_name, primitive_name = remainder.split("__", 1)
+    elif "_" in remainder:
+        server_name, primitive_name = remainder.split("_", 1)
+    server = mcp_servers.setdefault(
+        server_name,
+        {"invocation_count": 0, "uri": None, "primitives": {}},
+    )
+    server["invocation_count"] += 1
+    primitive = server["primitives"].setdefault(
+        primitive_name,
+        {"primitive_type": "tool", "invocation_count": 0},
+    )
+    primitive["invocation_count"] += 1
+
 
 def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParser] = None) -> list[SessionMeta]:
     """Parse Codex SQLite database + JSONL session files.
@@ -61,7 +112,7 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
     SQLite: ~/.codex/state_5.sqlite table `threads`
     Sessions: ~/.codex/sessions/{y}/{m}/{d}/rollout-*.jsonl
     """
-    db_path = Path.home() / ".codex" / "state_5.sqlite"
+    db_path = parser._paths.state_db_path
     if not db_path.is_file():
         return []
 
@@ -119,26 +170,21 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
             # Subagent count from thread_spawn_edges
             sub_count = spawn_counts.get(source_id, 0)
 
-            results.append(SessionMeta(
-                id=_make_session_id(Harness.CODEX, source_id),
-                source_session_id=source_id,
-                harness=Harness.CODEX,
-                harness_version=str(harness_version) if harness_version else None,
-                project_name=project_name,
-                git_repo_name=project_name,
-                git_branch=git_branch,
-                model=model,
-                provider="openai",
-                message_count_user=0,
-                message_count_assistant=0,
-                message_count_total=0,
-                tool_call_count=0,
-                tokens=TokenUsage(total_tokens=total_tokens),
-                subagent_calls=sub_count,
-                plan_mode_entries=plan_entries,
-                plan_mode_exits=plan_entries,
-                started_at=started_at,
-            ))
+            results.append(parser.session_from_snapshot({
+                "id": _make_session_id(Harness.CODEX, source_id),
+                "source_session_id": source_id,
+                "harness_version": str(harness_version) if harness_version else None,
+                "project_name": project_name,
+                "git_repo_name": project_name,
+                "git_branch": git_branch,
+                "model": model,
+                "provider": "openai",
+                "tokens": TokenUsage(total_tokens=total_tokens),
+                "subagent_calls": sub_count,
+                "plan_mode_entries": plan_entries,
+                "plan_mode_exits": plan_entries,
+                "started_at": started_at,
+            }))
 
         conn.close()
     except sqlite3.Error:
@@ -150,7 +196,7 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
     #   type=response_item, payload.type=message, payload.role=user/assistant
     #   type=response_item, payload.type=function_call, payload.name=tool_name
     session_lookup = {s.source_session_id: i for i, s in enumerate(results)}
-    sessions_dir = Path.home() / ".codex" / "sessions"
+    sessions_dir = parser._paths.sessions_dir
     if sessions_dir.is_dir():
         for jsonl_file in sessions_dir.rglob("rollout-*.jsonl"):
             try:
@@ -165,6 +211,7 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                 plan_mode_entries = 0
                 plan_mode_exits = 0
                 skill_invocations: dict[str, int] = {}
+                mcp_servers: dict[str, dict] = {}
                 jsonl_session_id: Optional[str] = None
                 jsonl_project: Optional[str] = None
                 jsonl_version: Optional[str] = None
@@ -211,6 +258,7 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                                             background_agents += 1
                                     if c["is_mcp"]:
                                         mcp_calls += 1
+                                        _register_mcp_tool(mcp_servers, tool_name)
                                     if c["skill_name"]:
                                         skill_invocations[c["skill_name"]] = skill_invocations.get(c["skill_name"], 0) + 1
                                     if c["is_plan_enter"]:
@@ -240,6 +288,24 @@ def _parse_codex(since: Optional[datetime] = None, parser: Optional[HarnessParse
                     d["skills_used"] = {
                         name: {"count": count, "source": "plugin"}
                         for name, count in skill_invocations.items()
+                    }
+                    d["mcp_servers"] = {
+                        **getattr(old, "mcp_servers", {}),
+                        **{
+                            name: {
+                                "count": info["invocation_count"],
+                                "uri": info.get("uri"),
+                                "primitives": [
+                                    {
+                                        "name": primitive_name,
+                                        "type": primitive_info.get("primitive_type", "tool"),
+                                        "count": primitive_info.get("invocation_count", 0),
+                                    }
+                                    for primitive_name, primitive_info in sorted(info["primitives"].items())
+                                ],
+                            }
+                            for name, info in sorted(mcp_servers.items())
+                        },
                     }
                     results[idx] = SessionMeta(**d)
 

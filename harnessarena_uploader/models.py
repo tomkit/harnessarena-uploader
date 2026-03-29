@@ -87,6 +87,39 @@ class ToolCallSummary:
 
 
 @dataclass(frozen=True)
+class MCPPrimitiveSummary:
+    """Aggregated count of a single MCP primitive within a session."""
+
+    name: str
+    primitive_type: str = "tool"
+    invocation_count: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.name.strip():
+            raise ValueError("name must be a non-empty string")
+        if not self.primitive_type or not self.primitive_type.strip():
+            raise ValueError("primitive_type must be a non-empty string")
+        if not isinstance(self.invocation_count, int) or self.invocation_count < 1:
+            raise ValueError(f"invocation_count must be >= 1, got {self.invocation_count!r}")
+
+
+@dataclass(frozen=True)
+class MCPServerSummary:
+    """Aggregated count of MCP usage grouped by server."""
+
+    server_name: str
+    invocation_count: int
+    uri: Optional[str] = None
+    primitives: tuple[MCPPrimitiveSummary, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not self.server_name or not self.server_name.strip():
+            raise ValueError("server_name must be a non-empty string")
+        if not isinstance(self.invocation_count, int) or self.invocation_count < 1:
+            raise ValueError(f"invocation_count must be >= 1, got {self.invocation_count!r}")
+
+
+@dataclass(frozen=True)
 class HarnessMeta:
     """Metadata about the harness itself (not per-session).
 
@@ -170,6 +203,9 @@ class SessionMeta:
     # --- Skills used (name → {count, source}) -----------------------------
     skills_used: dict = field(default_factory=dict)
 
+    # --- MCP servers/primitives used within the session --------------------
+    mcp_servers: dict = field(default_factory=dict)
+
     # --- Daily breakdown (date → metrics) ---------------------------------
     daily: list = field(default_factory=list)
 
@@ -188,6 +224,13 @@ class SessionMeta:
 
     # --- Derived metrics ----------------------------------------------------
     intervention_rate: Optional[float] = None  # user prompts / tool calls
+
+    # Harness execution time: seconds the harness spent working between user prompts.
+    # Measured as sum of (user_prompt_ts → last_response_ts_before_next_user) per turn.
+    # Excludes idle time (turns >30min assumed user walked away).
+    total_exec_seconds: Optional[float] = None
+    mean_turn_seconds: Optional[float] = None
+    median_turn_seconds: Optional[float] = None
 
     # --- Timing (UTC ISO 8601) ----------------------------------------------
     started_at: str = ""
