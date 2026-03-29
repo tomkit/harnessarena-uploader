@@ -29,7 +29,7 @@ def upload_batch(batch: UploadBatch, api_url: str, api_key: str) -> bool:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             print(f"Upload successful: {body.get('message', 'OK')}", file=sys.stderr)
             return True
