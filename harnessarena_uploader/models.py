@@ -177,11 +177,14 @@ class SessionMeta:
     cost_usd: Optional[float] = None
 
     # --- Data completeness ----------------------------------------------------
-    is_pruned: bool = False  # True if session data was partially recovered
-                             # (e.g., from sessions-index or history.jsonl
-                             # after JSONL files were garbage-collected).
-                             # Pruned sessions have prompt counts but no
-                             # token/tool data. UI should disclose this.
+    # Describes what data source this session was recovered from:
+    #   "full"    — parsed from JSONL session file (tokens, tools, prompts, model)
+    #   "partial" — from sessions-index.json (session count, dates, messageCount)
+    #              JSONL was garbage-collected but index entry survives
+    #   "prompts_only" — from history.jsonl supplement (prompt count only,
+    #              no tokens/tools, synthetic session spanning a date range)
+    data_completeness: str = "full"
+    is_pruned: bool = False  # Convenience: True if data_completeness != "full"
 
     # --- Derived metrics ----------------------------------------------------
     intervention_rate: Optional[float] = None  # user prompts / tool calls
