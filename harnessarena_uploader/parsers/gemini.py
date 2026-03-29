@@ -83,6 +83,7 @@ def _parse_gemini(since: Optional[datetime] = None) -> list[SessionMeta]:
             input_tokens = 0
             output_tokens = 0
             cache_read = 0
+            tool_tokens = 0
 
             for msg in messages:
                 msg_type = msg.get("type", "")
@@ -99,6 +100,8 @@ def _parse_gemini(since: Optional[datetime] = None) -> list[SessionMeta]:
                 input_tokens += _safe_int(tokens.get("input"))
                 output_tokens += _safe_int(tokens.get("output"))
                 cache_read += _safe_int(tokens.get("cached"))
+                # Gemini reports tool tokens separately — non-zero means tools were used
+                tool_tokens += _safe_int(tokens.get("tool"))
 
             total_count = len(messages)
 

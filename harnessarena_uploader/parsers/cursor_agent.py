@@ -101,7 +101,10 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                     except ValueError:
                         pass
 
-                # Parse blobs for message counts and tool calls
+                # Parse blobs for message counts, tool calls, and token estimation.
+                # Cursor Agent doesn't report token counts, so we estimate:
+                # ~4 chars per token for English text.
+                _CHARS_PER_TOKEN = 4
                 user_count = 0
                 assistant_count = 0
                 total_count = 0
@@ -112,6 +115,8 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                 mcp_calls = 0
                 plan_mode_entries = 0
                 plan_mode_exits = 0
+                estimated_input_tokens = 0
+                estimated_output_tokens = 0
 
                 try:
                     db_cursor.execute("SELECT data FROM blobs")
@@ -130,14 +135,27 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                             continue
 
                         role = msg.get("role", "")
+                        # Estimate tokens from content length
+                        content = msg.get("content", "")
+                        content_len = 0
+                        if isinstance(content, str):
+                            content_len = len(content)
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict):
+                                    content_len += len(block.get("text", ""))
+
                         if role == "user":
                             user_count += 1
+                            estimated_input_tokens += content_len // _CHARS_PER_TOKEN
                         elif role == "assistant":
                             assistant_count += 1
+                            estimated_output_tokens += content_len // _CHARS_PER_TOKEN
                         elif role == "tool":
-                            pass  # tool results, not counted as messages
+                            # Tool results count as input context
+                            estimated_input_tokens += content_len // _CHARS_PER_TOKEN
                         elif role == "system":
-                            pass
+                            estimated_input_tokens += content_len // _CHARS_PER_TOKEN
                         total_count += 1
 
                         # Extract tool calls from content blocks
@@ -198,7 +216,11 @@ def _parse_cursor_agent(since: Optional[datetime] = None, parser: Optional[Harne
                     mcp_calls=mcp_calls,
                     plan_mode_entries=plan_mode_entries,
                     plan_mode_exits=plan_mode_exits,
-                    tokens=TokenUsage(),
+                    tokens=TokenUsage(
+                        input_tokens=estimated_input_tokens,
+                        output_tokens=estimated_output_tokens,
+                        total_tokens=estimated_input_tokens + estimated_output_tokens,
+                    ),
                     tool_calls=tuple(
                         ToolCallSummary(n, c) for n, c in sorted(tool_names.items())
                     ),
