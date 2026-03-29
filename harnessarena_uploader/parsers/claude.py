@@ -372,9 +372,10 @@ def _parse_claude_jsonl(
     total_count = 0
     tool_call_count = 0
     subagent_calls = 0
-    # Execution time tracking: measure harness work time between user prompts
+    # Time span tracking: harness exec vs user idle periods
+    time_spans: list[dict] = []
     turn_exec_times: list[float] = []
-    _last_user_ts: datetime | None = None
+    _last_real_user_ts: datetime | None = None
     _last_nonuser_ts: datetime | None = None
     background_agents = 0
     mcp_calls = 0
@@ -426,20 +427,42 @@ def _parse_claude_jsonl(
                     last_ts = timestamp
 
             if entry_type == "user":
-                # Track execution time: gap from user prompt to last response
-                if _last_user_ts and _last_nonuser_ts and timestamp:
+                # Only track spans for real user prompts (not tool_result entries)
+                msg = entry.get("message", {})
+                content = msg.get("content", "")
+                is_tool_result = False
+                if isinstance(content, list):
+                    is_tool_result = any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in content
+                    )
+
+                if not is_tool_result and timestamp:
                     try:
-                        exec_time = (_last_nonuser_ts - _last_user_ts).total_seconds()
-                        if 0 < exec_time < 1800:  # cap at 30min (idle = user walked away)
-                            turn_exec_times.append(exec_time)
-                    except (TypeError, ValueError):
-                        pass
-                if timestamp:
-                    try:
-                        _last_user_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        this_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        if _last_real_user_ts and _last_nonuser_ts:
+                            exec_dur = (_last_nonuser_ts - _last_real_user_ts).total_seconds()
+                            idle_dur = (this_ts - _last_nonuser_ts).total_seconds()
+                            if exec_dur > 0:
+                                time_spans.append({
+                                    "type": "harness_exec",
+                                    "start": _last_real_user_ts.isoformat(),
+                                    "end": _last_nonuser_ts.isoformat(),
+                                    "seconds": round(exec_dur, 1),
+                                })
+                                if exec_dur < 1800:
+                                    turn_exec_times.append(exec_dur)
+                            if idle_dur > 0:
+                                time_spans.append({
+                                    "type": "user_idle",
+                                    "start": _last_nonuser_ts.isoformat(),
+                                    "end": this_ts.isoformat(),
+                                    "seconds": round(idle_dur, 1),
+                                })
+                        _last_real_user_ts = this_ts
+                        _last_nonuser_ts = None
                     except ValueError:
                         pass
-                _last_nonuser_ts = None
 
                 user_count += 1
                 total_count += 1
@@ -697,12 +720,19 @@ def _parse_claude_jsonl(
         except ValueError:
             pass
 
-    # Capture last turn execution time (user → end of session)
-    if _last_user_ts and _last_nonuser_ts:
+    # Capture last turn (user → end of session)
+    if _last_real_user_ts and _last_nonuser_ts:
         try:
-            exec_time = (_last_nonuser_ts - _last_user_ts).total_seconds()
-            if 0 < exec_time < 1800:
-                turn_exec_times.append(exec_time)
+            exec_dur = (_last_nonuser_ts - _last_real_user_ts).total_seconds()
+            if exec_dur > 0:
+                time_spans.append({
+                    "type": "harness_exec",
+                    "start": _last_real_user_ts.isoformat(),
+                    "end": _last_nonuser_ts.isoformat(),
+                    "seconds": round(exec_dur, 1),
+                })
+                if exec_dur < 1800:
+                    turn_exec_times.append(exec_dur)
         except (TypeError, ValueError):
             pass
 
@@ -772,4 +802,5 @@ def _parse_claude_jsonl(
         "total_exec_seconds": round(sum(turn_exec_times), 1) if turn_exec_times else None,
         "mean_turn_seconds": round(sum(turn_exec_times) / len(turn_exec_times), 1) if turn_exec_times else None,
         "median_turn_seconds": round(sorted(turn_exec_times)[len(turn_exec_times) // 2], 1) if turn_exec_times else None,
+        "time_spans": time_spans,
     }), prompt_keys

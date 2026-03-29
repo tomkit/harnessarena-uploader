@@ -138,4 +138,5 @@ class HarnessParser(ABC):
             total_exec_seconds=snapshot.get("total_exec_seconds"),
             mean_turn_seconds=snapshot.get("mean_turn_seconds"),
             median_turn_seconds=snapshot.get("median_turn_seconds"),
+            time_spans=snapshot.get("time_spans", []),
         )

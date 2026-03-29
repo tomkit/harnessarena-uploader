@@ -232,6 +232,11 @@ class SessionMeta:
     mean_turn_seconds: Optional[float] = None
     median_turn_seconds: Optional[float] = None
 
+    # Time spans: alternating harness_exec and user_idle periods with timestamps.
+    # Each span: {"type": "harness_exec"|"user_idle", "start": ISO, "end": ISO, "seconds": float}
+    # Only includes real user-to-user transitions (tool_result entries excluded).
+    time_spans: list = field(default_factory=list)
+
     # --- Timing (UTC ISO 8601) ----------------------------------------------
     started_at: str = ""
     ended_at: Optional[str] = None
