@@ -468,6 +468,26 @@ def _parse_claude_jsonl(
 
             elif entry_type == "system":
                 total_count += 1
+                # Detect marketplace plugins from hook summaries
+                # Plugin paths appear in hookInfos.command (may use ${CLAUDE_PLUGIN_ROOT})
+                # or in hookErrors (contains resolved full paths)
+                subtype = entry.get("subtype", "")
+                if subtype == "stop_hook_summary":
+                    # Check both hookInfos commands and hookErrors for plugin paths
+                    texts_to_check = []
+                    for hook in entry.get("hookInfos", []):
+                        texts_to_check.append(hook.get("command", ""))
+                    for err in entry.get("hookErrors", []):
+                        if isinstance(err, str):
+                            texts_to_check.append(err)
+                    for text in texts_to_check:
+                        if "claude-plugins-official/" in text:
+                            idx = text.find("claude-plugins-official/")
+                            remainder = text[idx + len("claude-plugins-official/"):]
+                            plugin_name = remainder.split("/")[0]
+                            if plugin_name and plugin_name not in ("hooks", "plugins", ""):
+                                skill_invocations[plugin_name] += 1
+                                break  # one detection per hook entry
 
     # --- Also parse subagent JSONL files (same directory/{session_id}/subagents/) ---
     # Count subagents from BOTH tool_use blocks AND the directory listing
@@ -540,6 +560,19 @@ def _parse_claude_jsonl(
                             # (parent agent sending tasks), not human prompts.
                             # Count for total messages but NOT as user prompts.
                             total_count += 1
+                        elif entry_type == "system":
+                            # Detect marketplace plugins from hook summaries in subagents
+                            subtype = entry.get("subtype", "")
+                            if subtype == "stop_hook_summary":
+                                for hook in entry.get("hookInfos", []):
+                                    cmd = hook.get("command", "")
+                                    if "claude-plugins-official/" in cmd or "plugins/cache/" in cmd:
+                                        parts = cmd.split("/")
+                                        for i, p in enumerate(parts):
+                                            if p in ("claude-plugins-official", "cache") and i + 1 < len(parts):
+                                                plugin_name = parts[i + 1]
+                                                if plugin_name and plugin_name not in ("hooks",):
+                                                    skill_invocations[plugin_name] += 1
             except Exception:
                 continue
 
