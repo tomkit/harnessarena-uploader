@@ -252,6 +252,9 @@ def _collect_harness_meta(harness: Harness) -> HarnessMeta:
             f"Could not detect version for '{harness.value}' from history or installed binary."
         )
 
+    # Collect available inventory
+    available_tools, available_skills, available_mcp_servers, available_agents = _collect_harness_inventory(harness)
+
     return HarnessMeta(
         name=harness,
         cli_version=cli_version,
@@ -262,7 +265,215 @@ def _collect_harness_meta(harness: Harness) -> HarnessMeta:
         default_model=default_model,
         provider=provider,
         plugin_version=plugin_version,
+        available_tools=available_tools,
+        available_skills=available_skills,
+        available_mcp_servers=available_mcp_servers,
+        available_agents=available_agents,
     )
+
+
+def _read_skill_metadata(skill_dir: Path) -> dict:
+    """Read metadata from a skill's SKILL.md frontmatter. Never reads skill content."""
+    meta: dict = {"name": skill_dir.name}
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.is_file():
+        return meta
+    try:
+        in_front = False
+        for line in skill_md.read_text(encoding="utf-8").splitlines()[:30]:
+            stripped = line.strip()
+            if stripped == "---":
+                if in_front:
+                    break
+                in_front = True
+                continue
+            if in_front and ":" in stripped:
+                key, _, val = stripped.partition(":")
+                key = key.strip().lower()
+                val = val.strip().strip('"').strip("'")
+                if key == "description" and val and not val.endswith("|"):
+                    meta["description"] = val[:200]
+                elif key == "version" and val:
+                    meta["version"] = val
+                elif key == "author" and val:
+                    meta["author"] = val
+                    # Detect marketplace from author
+                    if val.lower() == "vercel":
+                        meta["marketplace"] = "vercel-labs"
+        # Install date from directory creation time
+        try:
+            import stat as stat_mod
+            st = skill_dir.stat()
+            created = datetime.fromtimestamp(st.st_birthtime, tz=timezone.utc)
+            meta["installed_at"] = created.strftime("%Y-%m-%d")
+        except (AttributeError, OSError):
+            pass
+    except OSError:
+        pass
+    return meta
+
+
+def _read_plugin_metadata(plugin_name: str, marketplace_slug: str = "claude-plugins-official") -> dict:
+    """Read metadata from a marketplace plugin's plugin.json cache."""
+    meta: dict = {"name": plugin_name, "marketplace": marketplace_slug}
+    cache_dir = Path.home() / ".claude" / "plugins" / "cache" / marketplace_slug / plugin_name
+    if not cache_dir.is_dir():
+        return meta
+    # Find any version's plugin.json (prefer newest)
+    for version_dir in sorted(cache_dir.iterdir(), reverse=True):
+        for plugin_dir_name in (".claude-plugin", ".cursor-plugin"):
+            pj = version_dir / plugin_dir_name / "plugin.json"
+            if pj.is_file():
+                try:
+                    data = json.loads(pj.read_text())
+                    if data.get("description"):
+                        meta["description"] = data["description"][:200]
+                    if data.get("version"):
+                        meta["version"] = data["version"]
+                    if data.get("homepage"):
+                        meta["url"] = data["homepage"]
+                    elif data.get("repository"):
+                        meta["url"] = data["repository"]
+                    author = data.get("author", {})
+                    if isinstance(author, dict) and author.get("name"):
+                        meta["author"] = author["name"]
+                    elif isinstance(author, str):
+                        meta["author"] = author
+                except (json.JSONDecodeError, OSError):
+                    pass
+                return meta
+    return meta
+
+
+# Canonical native tool descriptions per harness
+_CLAUDE_TOOLS = {
+    "Read": "Read file contents", "Write": "Write/create files", "Edit": "Edit with string replacement",
+    "Bash": "Execute shell commands", "Glob": "Find files by pattern", "Grep": "Search file contents",
+    "WebSearch": "Search the web", "WebFetch": "Fetch and process web content",
+    "Agent": "Spawn subagent for complex tasks", "Skill": "Load specialized skill instructions",
+    "ToolSearch": "Search for deferred tools", "EnterPlanMode": "Enter analysis-only mode",
+    "ExitPlanMode": "Exit plan mode", "TaskCreate": "Create a task", "TaskUpdate": "Update task status",
+    "TaskGet": "Get task details", "TaskList": "List all tasks", "NotebookEdit": "Edit Jupyter notebooks",
+    "LSP": "Language Server Protocol queries", "AskUserQuestion": "Ask the user a question",
+}
+_CLAUDE_AGENTS = {
+    "general-purpose": "General-purpose agent for multi-step tasks",
+    "Explore": "Fast agent for codebase exploration and search",
+    "Plan": "Software architect agent for designing implementation plans",
+}
+_GEMINI_TOOLS = {
+    "glob": "Find files by pattern", "grep_search": "Search file contents", "list_directory": "List directory",
+    "read_file": "Read file contents", "run_shell_command": "Execute shell commands",
+    "write_file": "Write files", "replace": "Replace text in files", "google_web_search": "Search the web",
+    "web_fetch": "Fetch web content", "read_many_files": "Read multiple files", "memory": "Store/recall facts",
+    "activate_skill": "Load a skill", "ask_user": "Ask the user", "enter_plan_mode": "Enter plan mode",
+    "exit_plan_mode": "Exit plan mode", "write_todos": "Write todo list", "get_internal_docs": "Get internal docs",
+    "update_topic": "Update conversation topic",
+    "tracker_create_task": "Create tracker task", "tracker_update_task": "Update tracker task",
+    "tracker_get_task": "Get tracker task", "tracker_list_tasks": "List tracker tasks",
+    "tracker_add_dependency": "Add task dependency", "tracker_visualize": "Visualize tasks",
+}
+_GEMINI_AGENTS = {
+    "generalist": "General-purpose subagent for diverse tasks",
+    "cli_help": "CLI documentation and help agent",
+    "codebase_investigator": "Deep codebase analysis agent",
+}
+_CODEX_TOOLS = {
+    "exec_command": "Execute commands", "shell": "Shell access", "write_stdin": "Write to stdin",
+    "update_plan": "Update execution plan", "tool_suggest": "Suggest tools",
+    "list_mcp_resources": "List MCP resources", "list_mcp_resource_templates": "List MCP templates",
+}
+_CODEX_AGENTS = {"spawn_agent": "Spawn a collaborative subagent", "wait_agent": "Wait for subagent completion"}
+_OPENCODE_TOOLS = {
+    "bash": "Execute shell commands", "edit": "Edit files", "glob": "Find files",
+    "read": "Read files", "write": "Write files", "question": "Ask the user",
+    "todowrite": "Write todo items", "skill": "Load a skill", "task": "Spawn a subagent task",
+}
+_CURSOR_TOOLS = {
+    "Read": "Read files", "Write": "Write files", "Edit": "Edit files", "Shell": "Execute commands",
+    "Glob": "Find files", "Grep": "Search contents", "LS": "List directory",
+    "StrReplace": "String replacement", "ReadLints": "Read lint results",
+    "WebSearch": "Search the web", "Task": "Create task",
+}
+
+
+def _collect_harness_inventory(
+    harness: Harness,
+) -> tuple[tuple, tuple, tuple, tuple]:
+    """Collect available tools, skills, MCP servers, and agent types with metadata."""
+    tools: list[dict] = []
+    skills: list[dict] = []
+    mcp_servers: list[dict] = []
+    agents: list[dict] = []
+
+    try:
+        if harness == Harness.CLAUDE:
+            tools = [{"name": n, "description": d} for n, d in sorted(_CLAUDE_TOOLS.items())]
+            agents = [{"name": n, "description": d} for n, d in sorted(_CLAUDE_AGENTS.items())]
+            claude_home = get_claude_history_paths().home
+            # Custom skills from ~/.claude/skills/
+            skills_dir = claude_home / "skills"
+            seen_skills: set[str] = set()
+            if skills_dir.is_dir():
+                for d in sorted(skills_dir.iterdir()):
+                    if d.is_dir():
+                        skills.append(_read_skill_metadata(d))
+                        seen_skills.add(d.name)
+            # Marketplace plugins from settings + plugin cache
+            settings_file = claude_home / "settings.json"
+            if settings_file.is_file():
+                try:
+                    data = json.loads(settings_file.read_text())
+                    for pid in (data.get("enabledPlugins") or {}):
+                        base = pid.split("@")[0]
+                        if base and base not in seen_skills:
+                            skills.append(_read_plugin_metadata(base))
+                            seen_skills.add(base)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        elif harness == Harness.GEMINI:
+            tools = [{"name": n, "description": d} for n, d in sorted(_GEMINI_TOOLS.items())]
+            agents = [{"name": n, "description": d} for n, d in sorted(_GEMINI_AGENTS.items())]
+            seen_skills: set[str] = set()
+            for skills_dir in [get_gemini_history_paths().skills_dir, get_gemini_history_paths().agents_skills_dir]:
+                if skills_dir.is_dir():
+                    for d in sorted(skills_dir.iterdir()):
+                        if d.is_dir() and d.name not in seen_skills:
+                            skills.append(_read_skill_metadata(d))
+                            seen_skills.add(d.name)
+
+        elif harness == Harness.CODEX:
+            tools = [{"name": n, "description": d} for n, d in sorted(_CODEX_TOOLS.items())]
+            agents = [{"name": n, "description": d} for n, d in sorted(_CODEX_AGENTS.items())]
+            paths = get_codex_history_paths()
+            if paths.config_path.is_file():
+                try:
+                    for line in paths.config_path.read_text().splitlines():
+                        line = line.strip()
+                        if line.startswith("[plugins."):
+                            name = line.split('"')[1] if '"' in line else ""
+                            base = name.split("@")[0]
+                            if base:
+                                skills.append({"name": base})
+                except OSError:
+                    pass
+
+        elif harness == Harness.OPENCODE:
+            tools = [{"name": n, "description": d} for n, d in sorted(_OPENCODE_TOOLS.items())]
+            skills_dir = Path.home() / ".claude" / "skills"
+            if skills_dir.is_dir():
+                for d in sorted(skills_dir.iterdir()):
+                    if d.is_dir():
+                        skills.append(_read_skill_metadata(d))
+
+        elif harness == Harness.AGENT:
+            tools = [{"name": n, "description": d} for n, d in sorted(_CURSOR_TOOLS.items())]
+
+    except Exception:
+        pass
+
+    return (tuple(tools), tuple(skills), tuple(mcp_servers), tuple(agents))
 
 
 def _apply_aliases(session: SessionMeta, aliases: dict[str, str]) -> SessionMeta:

@@ -6,6 +6,25 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
+# Common Schema Version (semver)
+#
+# Tracks the data model contract between the uploader and the server.
+# Major/minor bumps are backwards-incompatible (server must be updated first).
+# Patch bumps are backwards-compatible (new optional fields, bug fixes).
+#
+# 0.0.1  Initial schema: SessionMeta with tokens, prompts, tool_calls, daily
+# 0.0.2  Added data_completeness (full/partial/prompts_only), harness_version
+# 0.0.3  Added time_spans (harness_exec, user_idle), exec metrics
+# 0.0.4  Added source_session_id, SubagentMeta, plan_mode spans
+# 0.0.5  Added tool_call category, parent_session_id, agent_name
+# 0.1.0  Current: available inventory (tools/skills/mcp/agents per harness),
+#         marketplace integration, plugin_marketplaces, subagent_breakdown,
+#         skill source/scope/marketplace, MCP server tracking
+# ---------------------------------------------------------------------------
+HARNESSARENA_SCHEMA_VERSION = "0.1.0"
+
+
+# ---------------------------------------------------------------------------
 # Enums — closed sets, never free text
 # ---------------------------------------------------------------------------
 
@@ -78,6 +97,7 @@ class ToolCallSummary:
 
     tool_name: str          # e.g. "Read", "Edit", "Bash", "WebSearch"
     invocation_count: int   # >= 1
+    category: str = "tool"  # "tool", "subagent", "mcp", "skill"
 
     def __post_init__(self) -> None:
         if not self.tool_name or not self.tool_name.strip():
@@ -141,6 +161,13 @@ class HarnessMeta:
     plugin_version: Optional[str] = None  # nullable: only harnesses with plugin systems (e.g. opencode)
     config_hash: Optional[str] = None   # nullable: sha256 of non-sensitive config keys
 
+    # Inventory: what's available/installed on this machine for this harness
+    # Tools/agents are {name, description}; skills add version/author; MCP adds type
+    available_tools: tuple = ()        # [{name, description}, ...]
+    available_skills: tuple = ()       # [{name, description, version?, author?, installed_at?}, ...]
+    available_mcp_servers: tuple = ()  # [{name, type?, command?}, ...]
+    available_agents: tuple = ()       # [{name, description}, ...]
+
     def __post_init__(self) -> None:
         if not isinstance(self.name, Harness):
             raise ValueError(f"name must be a Harness enum, got {self.name!r}")
@@ -156,6 +183,26 @@ class HarnessMeta:
             raise ValueError("shell is required")
         if not self.source or not self.source.strip():
             raise ValueError("source is required")
+
+
+@dataclass(frozen=True)
+class SubagentMeta:
+    """Non-sensitive metadata for a single subagent spawned within a session.
+
+    All fields are metadata only — no prompts, message content, or tool arguments.
+    Fields stub to defaults when a harness doesn't provide them.
+    """
+
+    ordinal: int                          # 0-indexed spawn order within session
+    parent_ordinal: Optional[int] = None  # ordinal of parent subagent; None = spawned by root
+    mode: str = "foreground"              # "foreground" | "background"
+    subagent_type: str = ""               # Claude: "general-purpose", "Explore", "Plan"
+                                          # Codex: "explorer", "worker"
+    nickname: str = ""                    # Codex: "Tesla", "Hume"; Others: ""
+    description: str = ""                 # Claude: task label from Agent input.description
+    depth: int = 1                        # Nesting level. 1 = direct child of root
+    total_tokens: int = 0
+    total_tool_calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -191,6 +238,8 @@ class SessionMeta:
     tokens: TokenUsage
 
     # --- Counts with defaults ------------------------------------------------
+    parent_session_id: Optional[str] = None  # source_session_id of parent (for subagent sessions)
+    agent_name: Optional[str] = None        # name/role of agent for subagent sessions
     subagent_calls: int = 0         # Agent tool invocations (subagents spawned)
     background_agents: int = 0      # agents launched in background mode
     mcp_calls: int = 0              # MCP server tool invocations
@@ -199,6 +248,9 @@ class SessionMeta:
 
     # --- Tool breakdown (may be empty) --------------------------------------
     tool_calls: tuple[ToolCallSummary, ...] = field(default_factory=tuple)
+
+    # --- Subagent metadata (per-agent details) --------------------------------
+    subagents: tuple[SubagentMeta, ...] = field(default_factory=tuple)
 
     # --- Skills used (name → {count, source}) -----------------------------
     skills_used: dict = field(default_factory=dict)
@@ -279,6 +331,7 @@ class UploadBatch:
     machine_id: str                          # sha256 of hostname — not the hostname itself
     created_at: str                          # ISO 8601 UTC
 
+    schema_version: str = HARNESSARENA_SCHEMA_VERSION     # common data model version (semver)
     session_count: int = 0                   # len(sessions), denormalized for quick access
     total_tokens: int = 0                    # sum of all session token totals
 

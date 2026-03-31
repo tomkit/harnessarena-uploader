@@ -10,15 +10,20 @@ from .batch import serialize_batch
 from .models import UploadBatch
 
 
-def upload_batch(batch: UploadBatch, api_url: str, api_key: str) -> bool:
+def upload_batch(batch: UploadBatch, api_url: str, api_key: str, force: bool = False) -> bool:
     """Upload batch to harnessarena.com API.
 
     Uses urllib to avoid external dependencies.
+    Default: append-only (new sessions only).
+    force=True: delete and re-insert all sessions (full bootstrap).
     """
     payload = json.dumps(serialize_batch(batch), default=str).encode("utf-8")
+    url = f"{api_url}/api/v1/upload"
+    if force:
+        url += "?force=true"
 
     req = urllib.request.Request(
-        f"{api_url}/api/v1/upload",
+        url,
         data=payload,
         headers={
             "Content-Type": "application/json",

@@ -139,4 +139,7 @@ class HarnessParser(ABC):
             mean_turn_seconds=snapshot.get("mean_turn_seconds"),
             median_turn_seconds=snapshot.get("median_turn_seconds"),
             time_spans=snapshot.get("time_spans", []),
+            parent_session_id=snapshot.get("parent_session_id"),
+            agent_name=snapshot.get("agent_name"),
+            subagents=tuple(snapshot.get("subagents", ())),
         )

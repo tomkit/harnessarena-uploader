@@ -8,27 +8,17 @@ from typing import Optional
 
 from ..base_parser import HarnessParser
 from ..history_paths import get_claude_history_paths
-from ..metric_strategies import (
-    ConstantSessionsMetricStrategy,
-    HarnessMetricStrategies,
-    SnapshotCostMetricStrategy,
-    SnapshotDailyMetricStrategy,
-    SnapshotMCPMetricStrategy,
-    SnapshotPlanMetricStrategy,
-    SnapshotPromptMetricStrategy,
-    SnapshotSkillMetricStrategy,
-    SnapshotSubagentMetricStrategy,
-    SnapshotTokenMetricStrategy,
-    SnapshotToolMetricStrategy,
-)
+from ..metric_strategies import HarnessMetricStrategies
 from ..helpers import (
     _basename_only,
     _decode_claude_project_dir,
     _extract_user_display_text,
     _make_prompt_key,
     _make_session_id,
+    _register_mcp_tool,
 )
-from ..models import Harness, SessionMeta, TokenUsage, ToolCallSummary
+from ..models import Harness, SessionMeta, SubagentMeta, TokenUsage, ToolCallSummary
+from ..trackers import DailyTracker, PlanModeTracker, SubagentCollector, TimeSpanTracker, ToolClassifier
 
 
 class ClaudeParser(HarnessParser):
@@ -38,18 +28,7 @@ class ClaudeParser(HarnessParser):
 
     def __init__(self) -> None:
         self._paths = get_claude_history_paths()
-        self._strategies = HarnessMetricStrategies(
-            sessions=ConstantSessionsMetricStrategy(),
-            prompts=SnapshotPromptMetricStrategy(),
-            subagents=SnapshotSubagentMetricStrategy(),
-            mcp=SnapshotMCPMetricStrategy(),
-            skills=SnapshotSkillMetricStrategy(),
-            tools=SnapshotToolMetricStrategy(),
-            tokens=SnapshotTokenMetricStrategy(),
-            plan=SnapshotPlanMetricStrategy(),
-            daily=SnapshotDailyMetricStrategy(),
-            cost=SnapshotCostMetricStrategy(),
-        )
+        self._strategies = HarnessMetricStrategies.snapshot_defaults()
 
     def detect_subagent(self, tool_name: str, tool_input: dict) -> bool:
         return tool_name == "Agent"
@@ -78,28 +57,6 @@ class ClaudeParser(HarnessParser):
 
     def metric_strategies(self) -> HarnessMetricStrategies:
         return self._strategies
-
-
-def _register_mcp_tool(mcp_servers: dict[str, dict], tool_name: str) -> None:
-    if not tool_name.startswith("mcp__"):
-        return
-    remainder = tool_name[len("mcp__") :]
-    server_name = remainder
-    primitive_name = tool_name
-    if "__" in remainder:
-        server_name, primitive_name = remainder.split("__", 1)
-    elif "_" in remainder:
-        server_name, primitive_name = remainder.split("_", 1)
-    server = mcp_servers.setdefault(
-        server_name,
-        {"invocation_count": 0, "uri": None, "primitives": {}},
-    )
-    server["invocation_count"] += 1
-    primitive = server["primitives"].setdefault(
-        primitive_name,
-        {"primitive_type": "tool", "invocation_count": 0},
-    )
-    primitive["invocation_count"] += 1
 
 
 def _parse_claude(
@@ -371,44 +328,26 @@ def _parse_claude_jsonl(
     assistant_count = 0
     total_count = 0
     tool_call_count = 0
-    subagent_calls = 0
-    # Time span tracking: harness exec vs user idle periods
-    time_spans: list[dict] = []
-    turn_exec_times: list[float] = []
-    _last_real_user_ts: datetime | None = None
-    _last_nonuser_ts: datetime | None = None
-    background_agents = 0
-    mcp_calls = 0
-    plan_mode_entries = 0
-    plan_mode_exits = 0
+
+    # Tracker instances
+    time_tracker = TimeSpanTracker()
+    plan_tracker = PlanModeTracker()
+    daily_tracker = DailyTracker()
+    tool_classifier = ToolClassifier()
+    subagent_collector = SubagentCollector()
+
     input_tokens = 0
     output_tokens = 0
     cache_read = 0
     cache_write = 0
-    tool_names: Counter = Counter()
-    skill_invocations: Counter = Counter()  # skill name → count
-    mcp_servers: dict[str, dict] = {}
     first_ts: Optional[str] = None
     last_ts: Optional[str] = None
     cwd: Optional[str] = None
-
-    # Daily breakdown: date → {tokens_in, tokens_out, prompts, tool_calls, ...}
-    daily_data: dict[str, dict] = {}
 
     def _get_date(ts: Optional[str]) -> Optional[str]:
         if ts and len(ts) >= 10:
             return ts[:10]
         return None
-
-    def _add_daily(date: str, **kwargs: int) -> None:
-        if date not in daily_data:
-            daily_data[date] = {
-                "date": date, "tokens_in": 0, "tokens_out": 0, "tokens_total": 0,
-                "prompts": 0, "sessions": 0, "subagent_calls": 0,
-                "background_agents": 0, "tool_calls": 0, "mcp_calls": 0,
-            }
-        for k, v in kwargs.items():
-            daily_data[date][k] = daily_data[date].get(k, 0) + v
 
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -432,35 +371,24 @@ def _parse_claude_jsonl(
                 content = msg.get("content", "")
                 is_tool_result = False
                 if isinstance(content, list):
-                    is_tool_result = any(
-                        isinstance(b, dict) and b.get("type") == "tool_result"
-                        for b in content
-                    )
+                    # Match tool_result blocks to pending tool_use calls
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            is_tool_result = True
+                            tuid = b.get("tool_use_id", "")
+                            if tuid and timestamp:
+                                try:
+                                    end_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                                    tool_span = time_tracker.on_tool_end(tuid, end_dt)
+                                    if tool_span:
+                                        plan_tracker.on_tool_span(tool_span)
+                                except (ValueError, TypeError):
+                                    pass
 
                 if not is_tool_result and timestamp:
                     try:
                         this_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                        if _last_real_user_ts and _last_nonuser_ts:
-                            exec_dur = (_last_nonuser_ts - _last_real_user_ts).total_seconds()
-                            idle_dur = (this_ts - _last_nonuser_ts).total_seconds()
-                            if exec_dur > 0:
-                                time_spans.append({
-                                    "type": "harness_exec",
-                                    "start": _last_real_user_ts.isoformat(),
-                                    "end": _last_nonuser_ts.isoformat(),
-                                    "seconds": round(exec_dur, 1),
-                                })
-                                if exec_dur < 1800:
-                                    turn_exec_times.append(exec_dur)
-                            if idle_dur > 0:
-                                time_spans.append({
-                                    "type": "user_idle",
-                                    "start": _last_nonuser_ts.isoformat(),
-                                    "end": this_ts.isoformat(),
-                                    "seconds": round(idle_dur, 1),
-                                })
-                        _last_real_user_ts = this_ts
-                        _last_nonuser_ts = None
+                        time_tracker.on_user_turn(this_ts)
                     except ValueError:
                         pass
 
@@ -475,7 +403,7 @@ def _parse_claude_jsonl(
                 if sid:
                     session_id = sid
                 if date:
-                    _add_daily(date, prompts=1)
+                    daily_tracker.add(date, prompts=1)
                 # Build prompt dedup key from display text + bucketed timestamp
                 display = _extract_user_display_text(entry)
                 if display and timestamp:
@@ -489,7 +417,7 @@ def _parse_claude_jsonl(
             elif entry_type == "assistant":
                 if timestamp:
                     try:
-                        _last_nonuser_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        time_tracker.on_nonuser_event(datetime.fromisoformat(timestamp.replace("Z", "+00:00")))
                     except ValueError:
                         pass
                 assistant_count += 1
@@ -503,11 +431,12 @@ def _parse_claude_jsonl(
                 msg_out = usage.get("output_tokens", 0)
                 input_tokens += msg_in
                 output_tokens += msg_out
+                time_tracker.on_tokens(msg_in, msg_out)
                 cache_read += usage.get("cache_read_input_tokens", 0)
                 cache_write += usage.get("cache_creation_input_tokens", 0)
 
                 if date:
-                    _add_daily(date, tokens_in=msg_in, tokens_out=msg_out,
+                    daily_tracker.add(date, tokens_in=msg_in, tokens_out=msg_out,
                                tokens_total=msg_in + msg_out)
 
                 # Count tool_use blocks in content (never read arguments/results)
@@ -520,56 +449,41 @@ def _parse_claude_jsonl(
                             continue
                         tool_call_count += 1
                         tool_name = block.get("name", "unknown")
-                        tool_names[tool_name] += 1
                         if date:
-                            _add_daily(date, tool_calls=1)
+                            daily_tracker.add(date, tool_calls=1)
 
                         tool_input = block.get("input", {})
                         if not isinstance(tool_input, dict):
                             tool_input = {}
 
-                        if parser:
-                            c = parser.classify_tool_call(tool_name, tool_input)
-                            if c["is_subagent"]:
-                                subagent_calls += 1
-                                if date:
-                                    _add_daily(date, subagent_calls=1)
-                                if c["is_background_agent"]:
-                                    background_agents += 1
-                                    if date:
-                                        _add_daily(date, background_agents=1)
-                            if c["skill_name"]:
-                                skill_invocations[c["skill_name"]] += 1
-                            if c["is_mcp"]:
-                                mcp_calls += 1
-                                _register_mcp_tool(mcp_servers, tool_name)
-                                if date:
-                                    _add_daily(date, mcp_calls=1)
-                            if c["is_plan_enter"]:
-                                plan_mode_entries += 1
-                            if c["is_plan_exit"]:
-                                plan_mode_exits += 1
-                        else:
-                            # Fallback: inline detection (no parser instance)
-                            if tool_name == "Agent":
-                                subagent_calls += 1
-                                if date:
-                                    _add_daily(date, subagent_calls=1)
-                                if tool_input.get("run_in_background"):
-                                    background_agents += 1
-                                    if date:
-                                        _add_daily(date, background_agents=1)
-                            elif tool_name == "Skill":
-                                skill_invocations[tool_input.get("skill", "unknown")] += 1
-                            elif tool_name.startswith("mcp__"):
-                                mcp_calls += 1
-                                if date:
-                                    _add_daily(date, mcp_calls=1)
+                        # Parse timestamp for plan tracker
+                        ts_dt: Optional[datetime] = None
+                        if timestamp:
+                            try:
+                                ts_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                            except ValueError:
+                                pass
+
+                        # Classify tool call via tracker (handles counting + side effects)
+                        category = tool_classifier.record(
+                            tool_name, tool_input, parser,
+                            timestamp_dt=ts_dt,
+                            plan_tracker=plan_tracker,
+                            time_tracker=time_tracker,
+                            subagent_collector=subagent_collector,
+                            daily_tracker=daily_tracker,
+                            date=date,
+                        )
+
+                        # Track tool call start for span timing
+                        tool_id = block.get("id", "")
+                        if tool_id and ts_dt:
+                            time_tracker.on_tool_start(tool_id, tool_name, category, ts_dt)
 
             elif entry_type == "system":
                 if timestamp:
                     try:
-                        _last_nonuser_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        time_tracker.on_nonuser_event(datetime.fromisoformat(timestamp.replace("Z", "+00:00")))
                     except ValueError:
                         pass
                 total_count += 1
@@ -591,8 +505,13 @@ def _parse_claude_jsonl(
                             remainder = text[idx + len("claude-plugins-official/"):]
                             plugin_name = remainder.split("/")[0]
                             if plugin_name and plugin_name not in ("hooks", "plugins", ""):
-                                skill_invocations[plugin_name] += 1
+                                tool_classifier.skill_invocations[plugin_name] += 1
                                 break  # one detection per hook entry
+
+    # Finalize time spans
+    time_spans, turn_exec_times = time_tracker.finalize()
+    # Append plan mode spans into time_spans
+    time_spans.extend(plan_tracker.spans)
 
     # --- Also parse subagent JSONL files (same directory/{session_id}/subagents/) ---
     # Count subagents from BOTH tool_use blocks AND the directory listing
@@ -602,10 +521,12 @@ def _parse_claude_jsonl(
         subagents_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
     subagent_files = list(subagents_dir.glob("*.jsonl")) if subagents_dir.is_dir() else []
     # Directory count is the ground truth — each file is a spawned subagent
-    subagent_calls = max(subagent_calls, len(subagent_files))
+    subagent_calls = max(tool_classifier.subagent_calls, len(subagent_files))
 
     if subagents_dir.is_dir():
-        for sub_jsonl in subagent_files:
+        for sub_idx, sub_jsonl in enumerate(subagent_files):
+            sub_tokens = 0
+            sub_tool_calls = 0
             try:
                 with open(sub_jsonl, "r", encoding="utf-8") as sf:
                     for line in sf:
@@ -632,10 +553,11 @@ def _parse_claude_jsonl(
                             msg_out = usage.get("output_tokens", 0)
                             input_tokens += msg_in
                             output_tokens += msg_out
+                            sub_tokens += msg_in + msg_out
                             cache_read += usage.get("cache_read_input_tokens", 0)
                             cache_write += usage.get("cache_creation_input_tokens", 0)
                             if date:
-                                _add_daily(date, tokens_in=msg_in, tokens_out=msg_out,
+                                daily_tracker.add(date, tokens_in=msg_in, tokens_out=msg_out,
                                            tokens_total=msg_in + msg_out)
                             content = msg.get("content", [])
                             if isinstance(content, list):
@@ -643,25 +565,26 @@ def _parse_claude_jsonl(
                                     if not isinstance(block, dict) or block.get("type") != "tool_use":
                                         continue
                                     tool_call_count += 1
+                                    sub_tool_calls += 1
                                     tool_name = block.get("name", "unknown")
-                                    tool_names[tool_name] += 1
+                                    tool_classifier.tool_names[tool_name] += 1
                                     if date:
-                                        _add_daily(date, tool_calls=1)
+                                        daily_tracker.add(date, tool_calls=1)
                                     if parser:
                                         ti = block.get("input", {})
                                         if not isinstance(ti, dict):
                                             ti = {}
                                         c = parser.classify_tool_call(tool_name, ti)
                                         if c["is_mcp"]:
-                                            mcp_calls += 1
-                                            _register_mcp_tool(mcp_servers, tool_name)
+                                            tool_classifier._mcp_calls += 1
+                                            _register_mcp_tool(tool_classifier.mcp_servers, tool_name)
                                             if date:
-                                                _add_daily(date, mcp_calls=1)
+                                                daily_tracker.add(date, mcp_calls=1)
                                     elif tool_name.startswith("mcp__"):
-                                        mcp_calls += 1
-                                        _register_mcp_tool(mcp_servers, tool_name)
+                                        tool_classifier._mcp_calls += 1
+                                        _register_mcp_tool(tool_classifier.mcp_servers, tool_name)
                                         if date:
-                                            _add_daily(date, mcp_calls=1)
+                                            daily_tracker.add(date, mcp_calls=1)
                         elif entry_type == "user":
                             # Subagent "user" entries are system-generated
                             # (parent agent sending tasks), not human prompts.
@@ -679,9 +602,14 @@ def _parse_claude_jsonl(
                                             if p in ("claude-plugins-official", "cache") and i + 1 < len(parts):
                                                 plugin_name = parts[i + 1]
                                                 if plugin_name and plugin_name not in ("hooks",):
-                                                    skill_invocations[plugin_name] += 1
+                                                    tool_classifier.skill_invocations[plugin_name] += 1
             except Exception:
                 continue
+            # Enrich matching subagent meta with per-file metrics
+            subagent_collector.enrich(sub_idx, total_tokens=sub_tokens, total_tool_calls=sub_tool_calls)
+
+    # Fill in any subagent metas discovered from directory but not from tool_use
+    subagent_collector.ensure_count(len(subagent_files))
 
     if user_count == 0 and assistant_count == 0:
         return None, prompt_keys
@@ -720,50 +648,82 @@ def _parse_claude_jsonl(
         except ValueError:
             pass
 
-    # Capture last turn (user → end of session)
-    if _last_real_user_ts and _last_nonuser_ts:
-        try:
-            exec_dur = (_last_nonuser_ts - _last_real_user_ts).total_seconds()
-            if exec_dur > 0:
-                time_spans.append({
-                    "type": "harness_exec",
-                    "start": _last_real_user_ts.isoformat(),
-                    "end": _last_nonuser_ts.isoformat(),
-                    "seconds": round(exec_dur, 1),
-                })
-                if exec_dur < 1800:
-                    turn_exec_times.append(exec_dur)
-        except (TypeError, ValueError):
-            pass
-
     total_tokens = input_tokens + output_tokens
 
     tool_summaries = tuple(
-        ToolCallSummary(tool_name=name, invocation_count=count)
-        for name, count in tool_names.most_common()
+        ToolCallSummary(tool_name=name, invocation_count=count, category=tool_classifier.tool_categories.get(name, "tool"))
+        for name, count in tool_classifier.tool_names.most_common()
     )
 
-    # Build skills_used dict (name → {count, source})
-    skills = {}
-    for skill_name, count in skill_invocations.most_common():
-        # Determine source: project-custom if in .claude/skills/, user-custom otherwise
-        source = "user-custom"
-        project_skills_dir = Path.home() / ".claude" / "skills" / skill_name
-        if not project_skills_dir.is_dir():
-            # Check project-level skills
-            project_custom = jsonl_path.parent / ".." / ".." / ".claude" / "skills" / skill_name
-            if project_custom.is_dir():
-                source = "project-custom"
-        skills[skill_name] = {"count": count, "source": source}
+    # Build skills_used dict (name → {count, source, scope, marketplace})
+    # Determine marketplace plugins from settings files
+    # Claude has two scope levels: user and project
+    # user:    ~/.claude/settings.json
+    # project: {cwd}/.claude/settings.json + settings.local.json (same scope, local is just gitignored)
+    marketplace_plugins: set[str] = set()
+    user_plugins: set[str] = set()
+    project_plugins: set[str] = set()
 
-    # Compute intervention_rate: user prompts / tool calls (lower = more autonomous)
+    def _collect_plugins(settings_path: Path, target: set) -> None:
+        if not settings_path.is_file():
+            return
+        try:
+            with open(settings_path, "r") as f:
+                data = json.load(f)
+            for pid in (data.get("enabledPlugins") or {}):
+                if "@claude-plugins-official" in pid:
+                    base = pid.split("@")[0]
+                    marketplace_plugins.add(base)
+                    target.add(base)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    _collect_plugins(Path.home() / ".claude" / "settings.json", user_plugins)
+    if cwd:
+        _collect_plugins(Path(cwd) / ".claude" / "settings.json", project_plugins)
+        _collect_plugins(Path(cwd) / ".claude" / "settings.local.json", project_plugins)
+
+    skills = {}
+    for skill_name, count in tool_classifier.skill_invocations.most_common():
+        base_name = skill_name.split(":")[0]
+        if base_name in marketplace_plugins:
+            source = "marketplace"
+            scope = "project" if base_name in project_plugins and base_name not in user_plugins else "user"
+            marketplace = "claude-plugins-official"
+        else:
+            source = "user-custom"
+            scope = "user"
+            marketplace = None
+            # Check if this is a Vercel skill (author: vercel in SKILL.md)
+            skill_dir = Path.home() / ".claude" / "skills" / base_name
+            if skill_dir.is_dir():
+                skill_md = skill_dir / "SKILL.md"
+                if skill_md.is_file():
+                    try:
+                        for line in skill_md.read_text(encoding="utf-8").splitlines()[:20]:
+                            if line.strip().lower().startswith("author:") and "vercel" in line.lower():
+                                source = "marketplace"
+                                marketplace = "vercel-labs"
+                                break
+                    except OSError:
+                        pass
+            if cwd:
+                proj_skill = Path(cwd) / ".claude" / "skills" / skill_name
+                if proj_skill.is_dir():
+                    source = "project-custom"
+                    scope = "project"
+        entry: dict = {"count": count, "source": source, "scope": scope}
+        if marketplace:
+            entry["marketplace"] = marketplace
+        skills[skill_name] = entry
+
     # Mark first date as having 1 session
     if first_ts:
         first_date = _get_date(first_ts)
-        if first_date and first_date in daily_data:
-            daily_data[first_date]["sessions"] = 1
+        if first_date:
+            daily_tracker.mark_session_start(first_date)
 
-    daily_list = sorted(daily_data.values(), key=lambda d: d["date"])
+    daily_list = daily_tracker.finalize()
 
     return parser.session_from_snapshot({
         "id": _make_session_id(Harness.CLAUDE, session_id),
@@ -779,11 +739,11 @@ def _parse_claude_jsonl(
         "message_count_total": total_count,
         "tool_call_count": tool_call_count,
         "subagent_calls": subagent_calls,
-        "background_agents": background_agents,
-        "mcp_calls": mcp_calls,
-        "mcp_servers": mcp_servers,
-        "plan_mode_entries": plan_mode_entries,
-        "plan_mode_exits": plan_mode_exits,
+        "background_agents": tool_classifier.background_agents,
+        "mcp_calls": tool_classifier.mcp_calls,
+        "mcp_servers": tool_classifier.mcp_servers,
+        "plan_mode_entries": plan_tracker.entries,
+        "plan_mode_exits": plan_tracker.exits,
         "tokens": TokenUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -803,4 +763,5 @@ def _parse_claude_jsonl(
         "mean_turn_seconds": round(sum(turn_exec_times) / len(turn_exec_times), 1) if turn_exec_times else None,
         "median_turn_seconds": round(sorted(turn_exec_times)[len(turn_exec_times) // 2], 1) if turn_exec_times else None,
         "time_spans": time_spans,
+        "subagents": subagent_collector.finalize(),
     }), prompt_keys

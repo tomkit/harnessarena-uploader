@@ -132,6 +132,22 @@ class HarnessMetricStrategies:
     daily: DailyMetricStrategy
     cost: CostMetricStrategy
 
+    @classmethod
+    def snapshot_defaults(cls) -> "HarnessMetricStrategies":
+        """Standard strategy set used by parsers that build sessions from snapshots."""
+        return cls(
+            sessions=ConstantSessionsMetricStrategy(),
+            prompts=SnapshotPromptMetricStrategy(),
+            subagents=SnapshotSubagentMetricStrategy(),
+            mcp=SnapshotMCPMetricStrategy(),
+            skills=SnapshotSkillMetricStrategy(),
+            tools=SnapshotToolMetricStrategy(),
+            tokens=SnapshotTokenMetricStrategy(),
+            plan=SnapshotPlanMetricStrategy(),
+            daily=SnapshotDailyMetricStrategy(),
+            cost=SnapshotCostMetricStrategy(),
+        )
+
 
 class ConstantSessionsMetricStrategy(SessionsMetricStrategy):
     def __init__(self, total_sessions: int = 1) -> None:

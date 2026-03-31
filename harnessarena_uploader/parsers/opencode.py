@@ -8,21 +8,10 @@ from typing import Optional
 
 from ..base_parser import HarnessParser
 from ..history_paths import get_opencode_history_paths
-from ..metric_strategies import (
-    ConstantSessionsMetricStrategy,
-    HarnessMetricStrategies,
-    SnapshotCostMetricStrategy,
-    SnapshotDailyMetricStrategy,
-    SnapshotMCPMetricStrategy,
-    SnapshotPlanMetricStrategy,
-    SnapshotPromptMetricStrategy,
-    SnapshotSkillMetricStrategy,
-    SnapshotSubagentMetricStrategy,
-    SnapshotTokenMetricStrategy,
-    SnapshotToolMetricStrategy,
-)
-from ..helpers import _basename_only, _make_session_id, _parse_timestamp, _safe_int
+from ..metric_strategies import HarnessMetricStrategies
+from ..helpers import _basename_only, _make_session_id, _parse_timestamp, _register_mcp_tool, _safe_int
 from ..models import Harness, SessionMeta, TokenUsage, ToolCallSummary
+from ..trackers import TimeSpanTracker, PlanModeTracker
 
 
 class OpenCodeParser(HarnessParser):
@@ -36,46 +25,13 @@ class OpenCodeParser(HarnessParser):
 
     def __init__(self) -> None:
         self._paths = get_opencode_history_paths()
-        self._strategies = HarnessMetricStrategies(
-            sessions=ConstantSessionsMetricStrategy(),
-            prompts=SnapshotPromptMetricStrategy(),
-            subagents=SnapshotSubagentMetricStrategy(),
-            mcp=SnapshotMCPMetricStrategy(),
-            skills=SnapshotSkillMetricStrategy(),
-            tools=SnapshotToolMetricStrategy(),
-            tokens=SnapshotTokenMetricStrategy(),
-            plan=SnapshotPlanMetricStrategy(),
-            daily=SnapshotDailyMetricStrategy(),
-            cost=SnapshotCostMetricStrategy(),
-        )
+        self._strategies = HarnessMetricStrategies.snapshot_defaults()
 
     def parse(self, since: Optional[datetime] = None) -> list[SessionMeta]:
         return _parse_opencode(since, parser=self, paths=self._paths)
 
     def metric_strategies(self) -> HarnessMetricStrategies:
         return self._strategies
-
-
-def _register_mcp_tool(mcp_servers: dict[str, dict], tool_name: str) -> None:
-    if not tool_name.startswith("mcp__"):
-        return
-    remainder = tool_name[len("mcp__") :]
-    server_name = remainder
-    primitive_name = tool_name
-    if "__" in remainder:
-        server_name, primitive_name = remainder.split("__", 1)
-    elif "_" in remainder:
-        server_name, primitive_name = remainder.split("_", 1)
-    server = mcp_servers.setdefault(
-        server_name,
-        {"invocation_count": 0, "uri": None, "primitives": {}},
-    )
-    server["invocation_count"] += 1
-    primitive = server["primitives"].setdefault(
-        primitive_name,
-        {"primitive_type": "tool", "invocation_count": 0},
-    )
-    primitive["invocation_count"] += 1
 
 
 def _parse_opencode(
@@ -123,6 +79,7 @@ def _parse_opencode(
 
         for session_row in sessions:
             session_id = str(session_row["id"])
+            parent_id = str(session_row["parent_id"]) if session_row["parent_id"] else None
             project_name = _basename_only(session_row["directory"])
             started_at = _parse_timestamp(session_row["time_created"])
 
@@ -173,13 +130,11 @@ def _parse_opencode(
                 elif role == "assistant":
                     assistant_count += 1
 
-                # Track agent name and mode from message metadata
-                # "build" = normal, "plan" = plan mode, other = custom agent/skill
+                # Track agent name for plan mode and subagent detection
+                # "build" = normal, "plan" = plan mode, other = custom agent (not a skill)
                 agent_name = data.get("agent", "")
                 if agent_name and agent_name not in ("build", ""):
                     agent_names.add(agent_name)
-                    if agent_name != "plan":
-                        skill_invocations[agent_name] = skill_invocations.get(agent_name, 0) + 1
 
                 # Model can be at data.modelID or data.model.modelID
                 m = data.get("modelID") or data.get("model")
@@ -210,7 +165,46 @@ def _parse_opencode(
                     except (TypeError, ValueError):
                         pass
 
-            # Count tool-type parts without reading content
+            # Build time spans from message timestamps
+            time_tracker = TimeSpanTracker()
+            plan_tracker = PlanModeTracker()
+            _in_plan_mode = False
+            for msg_row2 in cursor.execute(
+                "SELECT time_created, data FROM message WHERE session_id = ? ORDER BY time_created",
+                (session_row["id"],),
+            ).fetchall():
+                try:
+                    mdata = json.loads(msg_row2["data"]) if isinstance(msg_row2["data"], str) else {}
+                except json.JSONDecodeError:
+                    continue
+                msg_dt = datetime.fromtimestamp(msg_row2["time_created"] / 1000, tz=timezone.utc)
+                msg_role = mdata.get("role", "")
+                msg_agent = mdata.get("agent", "")
+                if msg_role == "user":
+                    time_tracker.on_user_turn(msg_dt)
+                elif msg_role == "assistant":
+                    time_tracker.on_nonuser_event(msg_dt)
+                # Track plan mode transitions by agent field changes
+                if msg_agent == "plan" and not _in_plan_mode:
+                    _in_plan_mode = True
+                    plan_tracker.on_enter(msg_dt)
+                elif msg_agent != "plan" and _in_plan_mode:
+                    _in_plan_mode = False
+                    plan_tracker.on_exit(msg_dt)
+
+            if _in_plan_mode and time_tracker._last_nonuser_ts:
+                plan_tracker.on_exit(time_tracker._last_nonuser_ts)
+
+            time_spans, turn_exec_times = time_tracker.finalize()
+            # Add plan mode spans
+            for ps in plan_tracker.spans:
+                time_spans.append(ps)
+            # Replace harness_exec with plan_mode for session-level plan
+            plan_tracker.replace_session_level(
+                time_spans, max(plan_entries, int("plan" in agent_names))
+            )
+
+            # Count tool-type parts and extract tool spans
             cursor.execute(
                 """SELECT p.data FROM part p
                    JOIN message m ON p.message_id = m.id
@@ -219,6 +213,7 @@ def _parse_opencode(
             )
             tool_call_count = 0
             tool_counts: dict[str, int] = {}
+            tool_categories: dict[str, str] = {}
             subagent_calls = 0
             background_agents = 0
             mcp_calls = 0
@@ -241,9 +236,63 @@ def _parse_opencode(
                 elif ptype == "tool" and "tool" in pdata:
                     tool_name = pdata["tool"]
                     is_tool = True
+                # Detect skill invocations: tool="skill" with state.input.name
+                if is_tool and tool_name == "skill":
+                    state = pdata.get("state", {})
+                    if isinstance(state, dict):
+                        meta = state.get("metadata", {}) or {}
+                        skill_name = (state.get("input", {}) or {}).get("name") or meta.get("name", "")
+                        if skill_name:
+                            # Determine source from metadata.dir path
+                            skill_dir = meta.get("dir", "")
+                            if ".claude/skills/" in skill_dir:
+                                source = "user-custom"
+                            elif "/.opencode/" in skill_dir or "plugins" in skill_dir:
+                                source = "marketplace"
+                            else:
+                                source = "user-custom"
+                            skill_invocations[skill_name] = {"count": skill_invocations.get(skill_name, {}).get("count", 0) + 1, "source": source}
+
                 if is_tool:
                     tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
                     tool_call_count += 1
+                    # Classify tool category
+                    if tool_name == "skill":
+                        tool_categories[tool_name] = "skill"
+                    elif tool_name == "task":
+                        tool_categories[tool_name] = "subagent"
+                    elif tool_name.startswith("mcp_") or tool_name.startswith("mcp__"):
+                        tool_categories[tool_name] = "mcp"
+                    else:
+                        tool_categories.setdefault(tool_name, "tool")
+                    # Extract tool span timing from state.time
+                    state = pdata.get("state", {})
+                    if isinstance(state, dict):
+                        time_info = state.get("time", {})
+                        if isinstance(time_info, dict) and time_info.get("start") and time_info.get("end"):
+                            try:
+                                t_start = datetime.fromtimestamp(time_info["start"] / 1000, tz=timezone.utc)
+                                t_end = datetime.fromtimestamp(time_info["end"] / 1000, tz=timezone.utc)
+                                dur = (t_end - t_start).total_seconds()
+                                if dur >= 0:
+                                    # Find which harness_exec span this tool falls in and add to its tool_spans
+                                    for sp in time_spans:
+                                        if sp.get("type") == "harness_exec" or sp.get("type") == "plan_mode":
+                                            sp_start = datetime.fromisoformat(sp["start"])
+                                            sp_end = datetime.fromisoformat(sp["end"])
+                                            if sp_start <= t_start <= sp_end:
+                                                if "tool_spans" not in sp:
+                                                    sp["tool_spans"] = []
+                                                sp["tool_spans"].append({
+                                                    "name": tool_name,
+                                                    "category": "tool",
+                                                    "start": t_start.isoformat(),
+                                                    "end": t_end.isoformat(),
+                                                    "seconds": round(dur, 3),
+                                                })
+                                                break
+                            except (TypeError, ValueError, OSError):
+                                pass
                     if parser:
                         tool_input = pdata.get("args", pdata.get("input", {}))
                         # OpenCode nests input in state.input
@@ -281,6 +330,8 @@ def _parse_opencode(
             results.append(parser.session_from_snapshot({
                 "id": _make_session_id(Harness.OPENCODE, session_id),
                 "source_session_id": session_id,
+                "parent_session_id": parent_id,
+                "agent_name": next((a for a in agent_names if a != "plan"), None) if parent_id else None,
                 "harness_version": None,
                 "project_name": project_name,
                 "git_repo_name": project_name,
@@ -303,17 +354,18 @@ def _parse_opencode(
                 "plan_mode_entries": max(plan_entries, plan_mode_entries, int("plan" in agent_names)),
                 "plan_mode_exits": max(plan_entries, plan_mode_exits, int("plan" in agent_names)),
                 "tool_calls": tuple(
-                    ToolCallSummary(name, count)
+                    ToolCallSummary(name, count, tool_categories.get(name, "tool"))
                     for name, count in sorted(tool_counts.items())
                 ),
-                "skills_used": {
-                    name: {"count": count, "source": "agent"}
-                    for name, count in skill_invocations.items()
-                },
+                "skills_used": skill_invocations,
                 "cost_usd": cost if cost > 0 else None,
                 "started_at": started_at,
                 "ended_at": ended_at if ended_at else None,
                 "duration_seconds": duration,
+                "time_spans": time_spans,
+                "total_exec_seconds": round(sum(t for t in turn_exec_times), 1) if turn_exec_times else None,
+                "mean_turn_seconds": round(sum(turn_exec_times) / len(turn_exec_times), 1) if turn_exec_times else None,
+                "median_turn_seconds": round(sorted(turn_exec_times)[len(turn_exec_times) // 2], 1) if turn_exec_times else None,
             }))
 
         conn.close()

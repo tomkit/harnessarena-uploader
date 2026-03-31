@@ -108,6 +108,44 @@ def _make_prompt_key(display_text: str, timestamp_ms: int) -> str:
     return f"{display_text[:100]}|{bucket}"
 
 
+def _register_mcp_tool(mcp_servers: dict[str, dict], tool_name: str) -> None:
+    """Register an MCP tool invocation into the mcp_servers accumulator.
+
+    Parses MCP tool naming conventions:
+      - Claude/Codex: mcp__<server>__<primitive>
+      - Gemini: mcp_<server>_<primitive>
+    """
+    if tool_name.startswith("mcp__"):
+        remainder = tool_name[len("mcp__"):]
+        if "__" in remainder:
+            server_name, primitive_name = remainder.split("__", 1)
+        elif "_" in remainder:
+            server_name, primitive_name = remainder.split("_", 1)
+        else:
+            server_name = remainder
+            primitive_name = tool_name
+    elif tool_name.startswith("mcp_"):
+        # Gemini single-underscore format: mcp_server_tool
+        remainder = tool_name[len("mcp_"):]
+        if "_" in remainder:
+            server_name, primitive_name = remainder.split("_", 1)
+        else:
+            server_name = remainder
+            primitive_name = tool_name
+    else:
+        return
+    server = mcp_servers.setdefault(
+        server_name,
+        {"invocation_count": 0, "uri": None, "primitives": {}},
+    )
+    server["invocation_count"] += 1
+    primitive = server["primitives"].setdefault(
+        primitive_name,
+        {"primitive_type": "tool", "invocation_count": 0},
+    )
+    primitive["invocation_count"] += 1
+
+
 def _extract_user_display_text(entry: dict) -> str:
     """Extract the first text block from a JSONL user entry.
 

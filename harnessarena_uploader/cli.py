@@ -60,6 +60,11 @@ def main() -> int:
         help="List unique projects found in the selected harnesses and exit.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Full bootstrap: delete and re-insert all sessions (instead of append-only)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"harnessarena-uploader {__version__}",
@@ -132,5 +137,5 @@ def main() -> int:
         )
         return 1
 
-    success = upload_batch(batch, args.api_url, args.api_key)
+    success = upload_batch(batch, args.api_url, args.api_key, force=args.force)
     return 0 if success else 1
