@@ -1,0 +1,43 @@
+{
+  "name": "harnessarena-uploader",
+  "version": "0.1.0",
+  "description": "Extract metadata from AI coding harness sessions and upload to harnessarena.com",
+  "type": "module",
+  "bin": {
+    "harnessarena-uploader": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "ai",
+    "coding",
+    "harness",
+    "claude",
+    "gemini",
+    "codex",
+    "cursor",
+    "opencode",
+    "metadata",
+    "uploader"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "commander": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}
