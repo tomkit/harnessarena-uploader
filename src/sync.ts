@@ -42,7 +42,7 @@ import {
   type Watermark,
 } from "./store.js";
 import { VERSION } from "./version.js";
-import { basenameOnly, decodeClaudeProjectDir } from "./helpers.js";
+import { basenameOnly, decodeClaudeProjectDir, decodeClaudeProjectDirFull } from "./helpers.js";
 import { collectHarnessInventory, collectProjectInventory } from "./batch.js";
 
 // ---------------------------------------------------------------------------
@@ -677,12 +677,10 @@ export function discoverHarnessInventory(
           for (const projectDir of readdirSync(paths.projectsDir, { withFileTypes: true })) {
             if (!projectDir.isDirectory()) continue;
             const projectPath = join(paths.projectsDir, projectDir.name);
-            const projectSlug = decodeClaudeProjectDir(projectDir.name) || projectDir.name;
-
-            // Claude project dirs encode the real path; we need the actual filesystem
-            // path to check for .claude/settings.json etc. The encoded dir name starts
-            // with the full path with slashes replaced by dashes. Reconstruct it.
-            const realProjectDir = projectDir.name.replace(/^-/, "/").replace(/-/g, "/");
+            const decoded = decodeClaudeProjectDirFull(projectDir.name);
+            if (!decoded) continue;
+            const projectSlug = decoded.slug;
+            const realProjectDir = decoded.realPath;
             const projInv = collectProjectInventory(harness, realProjectDir);
             if (projInv.plugins.length === 0 && projInv.mcp_servers.length === 0) continue;
 

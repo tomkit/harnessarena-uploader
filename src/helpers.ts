@@ -22,6 +22,11 @@ export function basenameOnly(path: string | null | undefined): string | null {
  * e.g. "-Users-tomkit-Projects-angry-bird-clone" → "angry-bird-clone"
  */
 export function decodeClaudeProjectDir(encodedName: string): string | null {
+  const result = decodeClaudeProjectDirFull(encodedName);
+  return result?.slug ?? null;
+}
+
+export function decodeClaudeProjectDirFull(encodedName: string): { slug: string; realPath: string } | null {
   const knownParents = [
     "-Projects-", "-Downloads-", "-Documents-", "-Desktop-",
     "-repos-", "-src-", "-code-", "-workspace-", "-work-",
@@ -29,11 +34,17 @@ export function decodeClaudeProjectDir(encodedName: string): string | null {
   for (const parent of knownParents) {
     const idx = encodedName.lastIndexOf(parent);
     if (idx >= 0) {
-      return encodedName.slice(idx + parent.length);
+      const slug = encodedName.slice(idx + parent.length);
+      // Prefix up to and including the parent dir, decode slashes
+      const prefix = encodedName.slice(0, idx + parent.length - 1); // exclude trailing -
+      const realPrefix = prefix.replace(/^-/, "/").replace(/-/g, "/");
+      return { slug, realPath: realPrefix + "/" + slug };
     }
   }
   const parts = encodedName.replace(/^-+/, "").split("-");
-  return parts.at(-1) || null;
+  const slug = parts.at(-1) || null;
+  if (!slug) return null;
+  return { slug, realPath: encodedName.replace(/^-/, "/").replace(/-/g, "/") };
 }
 
 export function utcnowIso(): string {
