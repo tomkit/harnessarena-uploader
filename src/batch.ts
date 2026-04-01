@@ -18,6 +18,10 @@ import {
   type HarnessMeta,
   type SessionMeta,
   type UploadBatch,
+  type Primitive,
+  type PluginEntry,
+  type InventoryBlob,
+  type PrimitiveScope,
 } from "./models.js";
 import { PARSERS } from "./parsers/index.js";
 import { VERSION } from "./version.js";
@@ -445,46 +449,6 @@ function readPluginMetadata(
 }
 
 /**
- * Discover skills provided by installed plugins.
- * Scans ~/.claude/plugins/cache/{marketplace}/{plugin}/{version}/skills/
- */
-function collectPluginSkills(): Record<string, string | undefined>[] {
-  const skills: Record<string, string | undefined>[] = [];
-  const cacheDir = join(homedir(), ".claude", "plugins", "cache");
-  if (!existsSync(cacheDir)) return skills;
-  const seen = new Set<string>();
-
-  try {
-    for (const marketplace of readdirSync(cacheDir)) {
-      const mDir = join(cacheDir, marketplace);
-      if (!statSync(mDir).isDirectory()) continue;
-      for (const plugin of readdirSync(mDir)) {
-        const pDir = join(mDir, plugin);
-        if (!statSync(pDir).isDirectory()) continue;
-        // Use latest version
-        const versions = readdirSync(pDir).sort().reverse();
-        for (const ver of versions) {
-          const skillsDir = join(pDir, ver, "skills");
-          if (!existsSync(skillsDir)) continue;
-          for (const skillName of readdirSync(skillsDir)) {
-            const skillPath = join(skillsDir, skillName);
-            if (!statSync(skillPath).isDirectory()) continue;
-            if (seen.has(skillName)) continue;
-            seen.add(skillName);
-            const meta = readSkillMetadata(skillPath);
-            meta.source = "plugin";
-            meta.plugin = `${plugin}@${marketplace}`;
-            skills.push(meta);
-          }
-          break; // only latest version
-        }
-      }
-    }
-  } catch { /* ignore */ }
-  return skills;
-}
-
-/**
  * Discover user commands from ~/.claude/commands/
  */
 function collectUserCommands(): Record<string, string | undefined>[] {
@@ -531,23 +495,32 @@ function sortedEntries(
 
 type InventoryItem = Record<string, string | undefined>;
 
+/**
+ * Collect user-level (harness-wide) inventory in the new Primitive/PluginEntry format.
+ */
 export function collectHarnessInventory(
   harness: Harness,
-): {
-  tools: InventoryItem[];
-  skills: InventoryItem[];
-  mcpServers: InventoryItem[];
-  agents: InventoryItem[];
-} {
-  const tools: InventoryItem[] = [];
-  const skills: InventoryItem[] = [];
-  const mcpServers: InventoryItem[] = [];
-  const agents: InventoryItem[] = [];
+): InventoryBlob {
+  const primitives: Primitive[] = [];
+  const plugins: PluginEntry[] = [];
 
   try {
     if (harness === Harness.CLAUDE) {
-      tools.push(...sortedEntries(CLAUDE_TOOLS));
-      agents.push(...sortedEntries(CLAUDE_AGENTS));
+      // Native tools → built-in standalone
+      for (const [name, description] of Object.entries(CLAUDE_TOOLS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'tool', name, scope: 'built-in', source: 'standalone', description });
+      }
+
+      // Built-in agents → built-in standalone
+      for (const [name, description] of Object.entries(CLAUDE_AGENTS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'agent', name, scope: 'built-in', source: 'standalone', description });
+      }
+
+      // Built-in MCP servers
+      for (const name of ['claude-in-chrome', 'computer-use']) {
+        primitives.push({ type: 'mcp_server', name, scope: 'built-in', source: 'standalone' });
+      }
+
       const claudeHome = getClaudeHistoryPaths().home;
 
       // 1. User skills from ~/.claude/skills/
@@ -556,58 +529,114 @@ export function collectHarnessInventory(
         for (const d of readdirSync(skillsDir).sort()) {
           const fullPath = join(skillsDir, d);
           if (statSync(fullPath).isDirectory()) {
-            const meta = readSkillMetadata(fullPath) as Record<string, string>;
-            meta.source = meta.source || "user";
-            skills.push(meta);
+            const meta = readSkillMetadata(fullPath);
+            primitives.push({
+              type: 'skill',
+              name: meta.name || d,
+              scope: 'user',
+              source: 'standalone',
+              description: meta.description,
+              version: meta.version,
+              author: meta.author,
+            });
           }
         }
       }
 
       // 2. User commands from ~/.claude/commands/
-      skills.push(...collectUserCommands());
+      for (const cmd of collectUserCommands()) {
+        primitives.push({
+          type: 'command',
+          name: cmd.name || '',
+          scope: 'user',
+          source: 'standalone',
+        });
+      }
 
-      // 3. Plugin-provided skills (from installed plugin caches)
-      skills.push(...collectPluginSkills());
-
-      // 4. Marketplace plugins (the plugins themselves, not their skills)
+      // 3. Installed plugins and their provided skills
       const installedFile = join(claudeHome, "plugins", "installed_plugins.json");
       if (existsSync(installedFile)) {
         try {
           const data = JSON.parse(readFileSync(installedFile, "utf-8"));
-          const plugins = data.plugins ?? {};
-          for (const [pid, entries] of Object.entries(plugins)) {
+          const installedPlugins = data.plugins ?? {};
+          for (const [pid, _entries] of Object.entries(installedPlugins)) {
             const base = pid.split("@")[0];
             const marketplace = pid.split("@")[1] || "unknown";
-            const meta = readPluginMetadata(base, marketplace) as Record<string, string>;
-            meta.source = "plugin";
-            skills.push(meta);
+            const meta = readPluginMetadata(base, marketplace);
+            const pluginTag = `${base}@${marketplace}`;
+
+            // Discover skills this plugin provides
+            const providedSkills = collectPluginSkillsForPlugin(base, marketplace);
+            const providedMcpServers: string[] = []; // future: discover MCP servers from plugins
+
+            // Determine plugin scope from installed_plugins.json
+            const entryData = _entries as Record<string, unknown>;
+            const pluginScope: PrimitiveScope =
+              entryData?.scope === "user" ? "user" : "user"; // installed plugins are user-scoped
+
+            plugins.push({
+              name: base,
+              marketplace,
+              scope: pluginScope,
+              enabled: true,
+              version: meta.version,
+              provides_skills: providedSkills.map(s => s.name),
+              provides_mcp_servers: providedMcpServers,
+            });
+
+            // Add plugin-provided skills as primitives
+            for (const skill of providedSkills) {
+              primitives.push({
+                type: 'skill',
+                name: skill.name,
+                scope: pluginScope,
+                source: 'plugin',
+                plugin: pluginTag,
+                marketplace,
+                description: skill.description,
+                version: skill.version,
+                author: skill.author,
+              });
+            }
           }
         } catch { /* ignore */ }
       }
     } else if (harness === Harness.GEMINI) {
-      tools.push(...sortedEntries(GEMINI_TOOLS));
-      agents.push(...sortedEntries(GEMINI_AGENTS));
+      for (const [name, description] of Object.entries(GEMINI_TOOLS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'tool', name, scope: 'built-in', source: 'standalone', description });
+      }
+      for (const [name, description] of Object.entries(GEMINI_AGENTS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'agent', name, scope: 'built-in', source: 'standalone', description });
+      }
       const geminiPaths = getGeminiHistoryPaths();
       const seenSkills = new Set<string>();
-      for (const skillsDir of [
-        geminiPaths.skillsDir,
-        geminiPaths.agentsSkillsDir,
-      ]) {
-        if (existsSync(skillsDir)) {
-          for (const d of readdirSync(skillsDir).sort()) {
-            const fullPath = join(skillsDir, d);
+      for (const sDir of [geminiPaths.skillsDir, geminiPaths.agentsSkillsDir]) {
+        if (existsSync(sDir)) {
+          for (const d of readdirSync(sDir).sort()) {
+            const fullPath = join(sDir, d);
             if (statSync(fullPath).isDirectory() && !seenSkills.has(d)) {
-              skills.push(
-                readSkillMetadata(fullPath) as Record<string, string>,
-              );
+              const meta = readSkillMetadata(fullPath);
+              primitives.push({
+                type: 'skill',
+                name: meta.name || d,
+                scope: 'user',
+                source: 'standalone',
+                description: meta.description,
+                version: meta.version,
+                author: meta.author,
+              });
               seenSkills.add(d);
             }
           }
         }
       }
     } else if (harness === Harness.CODEX) {
-      tools.push(...sortedEntries(CODEX_TOOLS));
-      agents.push(...sortedEntries(CODEX_AGENTS));
+      for (const [name, description] of Object.entries(CODEX_TOOLS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'tool', name, scope: 'built-in', source: 'standalone', description });
+      }
+      for (const [name, description] of Object.entries(CODEX_AGENTS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'agent', name, scope: 'built-in', source: 'standalone', description });
+      }
       const paths = getCodexHistoryPaths();
       if (existsSync(paths.configPath)) {
         try {
@@ -615,38 +644,89 @@ export function collectHarnessInventory(
           for (const line of lines) {
             const trimmed = line.trim();
             if (trimmed.startsWith("[plugins.")) {
-              const name = trimmed.includes('"')
-                ? trimmed.split('"')[1]
-                : "";
+              const name = trimmed.includes('"') ? trimmed.split('"')[1] : "";
               const base = name.split("@")[0];
               if (base) {
-                skills.push({ name: base });
+                plugins.push({
+                  name: base,
+                  marketplace: "codex",
+                  scope: 'user',
+                  enabled: true,
+                  provides_skills: [],
+                  provides_mcp_servers: [],
+                });
               }
             }
           }
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       }
     } else if (harness === Harness.OPENCODE) {
-      tools.push(...sortedEntries(OPENCODE_TOOLS));
+      for (const [name, description] of Object.entries(OPENCODE_TOOLS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'tool', name, scope: 'built-in', source: 'standalone', description });
+      }
+      // OpenCode can use Claude skills
       const skillsDir = join(homedir(), ".claude", "skills");
       if (existsSync(skillsDir)) {
         for (const d of readdirSync(skillsDir).sort()) {
           const fullPath = join(skillsDir, d);
           if (statSync(fullPath).isDirectory()) {
-            skills.push(readSkillMetadata(fullPath) as Record<string, string>);
+            const meta = readSkillMetadata(fullPath);
+            primitives.push({
+              type: 'skill',
+              name: meta.name || d,
+              scope: 'user',
+              source: 'standalone',
+              description: meta.description,
+              version: meta.version,
+              author: meta.author,
+            });
           }
         }
       }
     } else if (harness === Harness.AGENT) {
-      tools.push(...sortedEntries(CURSOR_TOOLS));
+      for (const [name, description] of Object.entries(CURSOR_TOOLS).sort(([a], [b]) => a.localeCompare(b))) {
+        primitives.push({ type: 'tool', name, scope: 'built-in', source: 'standalone', description });
+      }
     }
   } catch {
     // ignore
   }
 
-  return { tools, skills, mcpServers, agents };
+  return { primitives, plugins };
+}
+
+/**
+ * Discover skills provided by a specific installed plugin.
+ * Scans ~/.claude/plugins/cache/{marketplace}/{plugin}/{version}/skills/
+ */
+function collectPluginSkillsForPlugin(
+  pluginName: string,
+  marketplace: string,
+): Array<{ name: string; description?: string; version?: string; author?: string }> {
+  const skills: Array<{ name: string; description?: string; version?: string; author?: string }> = [];
+  const cacheDir = join(homedir(), ".claude", "plugins", "cache", marketplace, pluginName);
+  if (!existsSync(cacheDir)) return skills;
+
+  try {
+    const versions = readdirSync(cacheDir).sort().reverse();
+    for (const ver of versions) {
+      const skillsDir = join(cacheDir, ver, "skills");
+      if (!existsSync(skillsDir)) continue;
+      for (const skillName of readdirSync(skillsDir)) {
+        const skillPath = join(skillsDir, skillName);
+        if (!statSync(skillPath).isDirectory()) continue;
+        const meta = readSkillMetadata(skillPath);
+        skills.push({
+          name: meta.name || skillName,
+          description: meta.description,
+          version: meta.version,
+          author: meta.author,
+        });
+      }
+      break; // only latest version
+    }
+  } catch { /* ignore */ }
+  return skills;
 }
 
 /**
@@ -656,31 +736,25 @@ export function collectHarnessInventory(
 export function collectProjectInventory(
   harness: Harness,
   projectDir: string,
-): {
-  plugins: Record<string, string | undefined>[];
-  mcp_servers: Record<string, string | undefined>[];
-} {
-  const plugins: Record<string, string | undefined>[] = [];
-  const mcp_servers: Record<string, string | undefined>[] = [];
+): InventoryBlob {
+  const primitives: Primitive[] = [];
+  const pluginEntries: PluginEntry[] = [];
 
   try {
     if (harness === Harness.CLAUDE) {
+      // Track which plugin IDs come from settings.json vs settings.local.json
+      const projectPluginIds = new Set<string>();
+      const localPluginIds = new Set<string>();
+
       // Project-scoped plugins from .claude/settings.json
       const settingsFile = join(projectDir, ".claude", "settings.json");
       if (existsSync(settingsFile)) {
         try {
           const data = JSON.parse(readFileSync(settingsFile, "utf-8"));
-          for (const [pid, _val] of Object.entries(data.enabledPlugins ?? {})) {
-            const base = pid.split("@")[0];
-            if (base) {
-              plugins.push(
-                readPluginMetadata(base) as Record<string, string>,
-              );
-            }
+          for (const pid of Object.keys(data.enabledPlugins ?? {})) {
+            projectPluginIds.add(pid);
           }
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       }
 
       // Local overrides from .claude/settings.local.json
@@ -688,19 +762,62 @@ export function collectProjectInventory(
       if (existsSync(localSettingsFile)) {
         try {
           const data = JSON.parse(readFileSync(localSettingsFile, "utf-8"));
-          const seen = new Set(plugins.map((p) => p.name));
-          for (const [pid, _val] of Object.entries(data.enabledPlugins ?? {})) {
-            const base = pid.split("@")[0];
-            if (base && !seen.has(base)) {
-              plugins.push(
-                readPluginMetadata(base) as Record<string, string>,
-              );
-              seen.add(base);
-            }
+          for (const pid of Object.keys(data.enabledPlugins ?? {})) {
+            localPluginIds.add(pid);
           }
-        } catch {
-          // ignore
+        } catch { /* ignore */ }
+      }
+
+      // Merge: local takes precedence over project
+      const allPluginIds = new Set([...projectPluginIds, ...localPluginIds]);
+      for (const pid of allPluginIds) {
+        const base = pid.split("@")[0];
+        const marketplace = pid.split("@")[1] || "claude-plugins-official";
+        if (!base) continue;
+
+        // Scope: local if in settings.local.json, otherwise project
+        const scope: PrimitiveScope = localPluginIds.has(pid) ? 'local' : 'project';
+        const meta = readPluginMetadata(base, marketplace);
+        const providedSkills = collectPluginSkillsForPlugin(base, marketplace);
+
+        pluginEntries.push({
+          name: base,
+          marketplace,
+          scope,
+          enabled: true,
+          version: meta.version,
+          provides_skills: providedSkills.map(s => s.name),
+          provides_mcp_servers: [],
+        });
+
+        // Add plugin-provided skills as primitives
+        const pluginTag = `${base}@${marketplace}`;
+        for (const skill of providedSkills) {
+          primitives.push({
+            type: 'skill',
+            name: skill.name,
+            scope,
+            source: 'plugin',
+            plugin: pluginTag,
+            marketplace,
+            description: skill.description,
+            version: skill.version,
+            author: skill.author,
+          });
         }
+      }
+
+      // Project skills from {projectDir}/.claude/skills/
+      for (const skill of collectProjectSkills(projectDir)) {
+        primitives.push({
+          type: 'skill',
+          name: skill.name || '',
+          scope: 'project',
+          source: 'standalone',
+          description: skill.description,
+          version: skill.version,
+          author: skill.author,
+        });
       }
 
       // MCP servers from .mcp.json
@@ -711,16 +828,15 @@ export function collectProjectInventory(
           const servers = data.mcpServers ?? data.servers ?? data;
           if (typeof servers === "object" && servers !== null) {
             for (const serverName of Object.keys(servers)) {
-              const cfg = servers[serverName];
-              mcp_servers.push({
+              primitives.push({
+                type: 'mcp_server',
                 name: serverName,
-                command: typeof cfg?.command === "string" ? cfg.command : undefined,
+                scope: 'project',
+                source: 'standalone',
               });
             }
           }
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       }
     } else if (harness === Harness.GEMINI) {
       // Gemini project settings
@@ -728,14 +844,18 @@ export function collectProjectInventory(
       if (existsSync(settingsFile)) {
         try {
           const data = JSON.parse(readFileSync(settingsFile, "utf-8"));
-          // Gemini project settings may have extensions or tools
           const extensions = data.extensions ?? {};
           for (const [extName, _val] of Object.entries(extensions)) {
-            plugins.push({ name: extName });
+            pluginEntries.push({
+              name: extName,
+              marketplace: "gemini",
+              scope: 'project',
+              enabled: true,
+              provides_skills: [],
+              provides_mcp_servers: [],
+            });
           }
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       }
     }
     // Codex, Cursor, OpenCode: no project-level config — return empty
@@ -743,7 +863,7 @@ export function collectProjectInventory(
     // ignore
   }
 
-  return { plugins, mcp_servers };
+  return { primitives, plugins: pluginEntries };
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +934,21 @@ function collectHarnessMeta(harness: Harness): HarnessMeta {
     );
   }
 
-  const { tools, skills, mcpServers, agents } =
-    collectHarnessInventory(harness);
+  const inv = collectHarnessInventory(harness);
+
+  // Derive legacy-format arrays from primitives for HarnessMeta compatibility
+  const available_tools = inv.primitives
+    .filter(p => p.type === 'tool')
+    .map(p => ({ name: p.name, description: p.description }));
+  const available_skills = inv.primitives
+    .filter(p => p.type === 'skill')
+    .map(p => ({ name: p.name, description: p.description, source: p.source, plugin: p.plugin }));
+  const available_mcp_servers = inv.primitives
+    .filter(p => p.type === 'mcp_server')
+    .map(p => ({ name: p.name, description: p.description }));
+  const available_agents = inv.primitives
+    .filter(p => p.type === 'agent')
+    .map(p => ({ name: p.name, description: p.description }));
 
   return {
     name: harness,
@@ -828,10 +961,10 @@ function collectHarnessMeta(harness: Harness): HarnessMeta {
     provider,
     plugin_version: pluginVersion,
     config_hash: null,
-    available_tools: tools,
-    available_skills: skills,
-    available_mcp_servers: mcpServers,
-    available_agents: agents,
+    available_tools,
+    available_skills,
+    available_mcp_servers,
+    available_agents,
   };
 }
 

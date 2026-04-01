@@ -43,7 +43,7 @@ import {
 } from "./store.js";
 import { VERSION } from "./version.js";
 import { basenameOnly, decodeClaudeProjectDir, decodeClaudeProjectDirFull } from "./helpers.js";
-import { collectHarnessInventory, collectProjectInventory, collectProjectSkills } from "./batch.js";
+import { collectHarnessInventory, collectProjectInventory } from "./batch.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -652,22 +652,11 @@ export function discoverHarnessInventory(
   const deltas: BlobDelta[] = [];
 
   for (const harness of harnesses) {
-    // 1. User-level (_global) inventory
+    // 1. User-level (_global) inventory — new primitives/plugins format
     const inv = collectHarnessInventory(harness);
-    // Categorize: user skills, commands, plugin-provided skills, and marketplace plugins
-    const userSkills = inv.skills.filter((s) => s.source === "user" || (!s.source && !s.marketplace));
-    const commands = inv.skills.filter((s) => s.source === "command");
-    const pluginSkills = inv.skills.filter((s) => s.source === "plugin" && !s.marketplace);
-    const plugins = inv.skills.filter((s) => s.marketplace);
     const globalData = JSON.stringify({
-      scope: "user",
-      tools: inv.tools,
-      skills: userSkills,
-      commands,
-      plugin_skills: pluginSkills,
-      plugins,
-      mcp_servers: inv.mcpServers,
-      agents: inv.agents,
+      primitives: inv.primitives,
+      plugins: inv.plugins,
     });
     const globalKey = blobKey(userSlug, harness, "_global", "inventory", "primitives.json");
     const globalDelta = makeReplaceDelta(globalKey, [globalData], hashContent(globalData), "_global", "inventory");
@@ -680,21 +669,16 @@ export function discoverHarnessInventory(
         try {
           for (const projectDir of readdirSync(paths.projectsDir, { withFileTypes: true })) {
             if (!projectDir.isDirectory()) continue;
-            const projectPath = join(paths.projectsDir, projectDir.name);
             const decoded = decodeClaudeProjectDirFull(projectDir.name);
             if (!decoded) continue;
             const projectSlug = decoded.slug;
             const realProjectDir = decoded.realPath;
             const projInv = collectProjectInventory(harness, realProjectDir);
-            const projSkills = collectProjectSkills(realProjectDir);
-            if (projInv.plugins.length === 0 && projInv.mcp_servers.length === 0 && projSkills.length === 0) continue;
+            if (projInv.primitives.length === 0 && projInv.plugins.length === 0) continue;
 
             const projData = JSON.stringify({
-              scope: "project",
-              skills: projSkills,
+              primitives: projInv.primitives,
               plugins: projInv.plugins,
-              mcp_servers: projInv.mcp_servers,
-              agents: [],
             });
             const projKey = blobKey(userSlug, harness, projectSlug, "inventory", "primitives.json");
             const projDelta = makeReplaceDelta(projKey, [projData], hashContent(projData), projectSlug, "inventory");
@@ -710,18 +694,13 @@ export function discoverHarnessInventory(
         try {
           for (const projectDir of readdirSync(paths.tmpDir, { withFileTypes: true })) {
             if (!projectDir.isDirectory()) continue;
-            // Gemini project dirs are in tmpDir; the actual project path is not easily
-            // recoverable, so we check if there's a .gemini/ config in the tmpDir entry
             const projPath = join(paths.tmpDir, projectDir.name);
             const projInv = collectProjectInventory(harness, projPath);
-            if (projInv.plugins.length === 0 && projInv.mcp_servers.length === 0) continue;
+            if (projInv.primitives.length === 0 && projInv.plugins.length === 0) continue;
 
             const projData = JSON.stringify({
-              scope: "project",
-              skills: [],
+              primitives: projInv.primitives,
               plugins: projInv.plugins,
-              mcp_servers: projInv.mcp_servers,
-              agents: [],
             });
             const projKey = blobKey(userSlug, harness, projectDir.name, "inventory", "primitives.json");
             const projDelta = makeReplaceDelta(projKey, [projData], hashContent(projData), projectDir.name, "inventory");

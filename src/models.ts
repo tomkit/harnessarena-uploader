@@ -25,6 +25,39 @@ export enum MessageRole {
   TOOL = "tool",
 }
 
+// --- Inventory types ---
+
+export type PrimitiveType = 'skill' | 'mcp_server' | 'agent' | 'command' | 'tool';
+export type PrimitiveScope = 'local' | 'project' | 'user' | 'built-in';
+export type PrimitiveSource = 'standalone' | 'plugin';
+
+export interface Primitive {
+  type: PrimitiveType;
+  name: string;
+  scope: PrimitiveScope;
+  source: PrimitiveSource;
+  plugin?: string;          // e.g. "superpowers@claude-plugins-official" — only if source=plugin
+  marketplace?: string;     // e.g. "claude-plugins-official" — only if from marketplace
+  description?: string;
+  version?: string;
+  author?: string;
+}
+
+export interface PluginEntry {
+  name: string;             // e.g. "superpowers"
+  marketplace: string;      // e.g. "claude-plugins-official", "claudeai"
+  scope: PrimitiveScope;
+  enabled: boolean;
+  version?: string;
+  provides_skills: string[];
+  provides_mcp_servers: string[];
+}
+
+export interface InventoryBlob {
+  primitives: Primitive[];
+  plugins: PluginEntry[];
+}
+
 // --- Interfaces ---
 
 export interface TokenUsage {
