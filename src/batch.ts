@@ -374,9 +374,6 @@ function readSkillMetadata(
           meta.version = val;
         } else if (key === "author" && val) {
           meta.author = val;
-          if (val.toLowerCase() === "vercel") {
-            meta.marketplace = "vercel-labs";
-          }
         }
       }
     }
@@ -447,6 +444,83 @@ function readPluginMetadata(
   return meta;
 }
 
+/**
+ * Discover skills provided by installed plugins.
+ * Scans ~/.claude/plugins/cache/{marketplace}/{plugin}/{version}/skills/
+ */
+function collectPluginSkills(): Record<string, string | undefined>[] {
+  const skills: Record<string, string | undefined>[] = [];
+  const cacheDir = join(homedir(), ".claude", "plugins", "cache");
+  if (!existsSync(cacheDir)) return skills;
+  const seen = new Set<string>();
+
+  try {
+    for (const marketplace of readdirSync(cacheDir)) {
+      const mDir = join(cacheDir, marketplace);
+      if (!statSync(mDir).isDirectory()) continue;
+      for (const plugin of readdirSync(mDir)) {
+        const pDir = join(mDir, plugin);
+        if (!statSync(pDir).isDirectory()) continue;
+        // Use latest version
+        const versions = readdirSync(pDir).sort().reverse();
+        for (const ver of versions) {
+          const skillsDir = join(pDir, ver, "skills");
+          if (!existsSync(skillsDir)) continue;
+          for (const skillName of readdirSync(skillsDir)) {
+            const skillPath = join(skillsDir, skillName);
+            if (!statSync(skillPath).isDirectory()) continue;
+            if (seen.has(skillName)) continue;
+            seen.add(skillName);
+            const meta = readSkillMetadata(skillPath);
+            meta.source = "plugin";
+            meta.plugin = `${plugin}@${marketplace}`;
+            skills.push(meta);
+          }
+          break; // only latest version
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return skills;
+}
+
+/**
+ * Discover user commands from ~/.claude/commands/
+ */
+function collectUserCommands(): Record<string, string | undefined>[] {
+  const commands: Record<string, string | undefined>[] = [];
+  const commandsDir = join(homedir(), ".claude", "commands");
+  if (!existsSync(commandsDir)) return commands;
+  try {
+    for (const file of readdirSync(commandsDir)) {
+      if (!file.endsWith(".md")) continue;
+      const name = file.replace(/\.md$/, "");
+      commands.push({ name, source: "command" });
+    }
+  } catch { /* ignore */ }
+  return commands;
+}
+
+/**
+ * Discover project-scoped skills from {projectDir}/.claude/skills/
+ */
+export function collectProjectSkills(projectDir: string): Record<string, string | undefined>[] {
+  const skills: Record<string, string | undefined>[] = [];
+  const skillsDir = join(projectDir, ".claude", "skills");
+  if (!existsSync(skillsDir)) return skills;
+  try {
+    for (const d of readdirSync(skillsDir).sort()) {
+      const fullPath = join(skillsDir, d);
+      if (statSync(fullPath).isDirectory()) {
+        const meta = readSkillMetadata(fullPath);
+        meta.scope = "project";
+        skills.push(meta);
+      }
+    }
+  } catch { /* ignore */ }
+  return skills;
+}
+
 function sortedEntries(
   obj: Record<string, string>,
 ): Array<{ name: string; description: string }> {
@@ -455,18 +529,20 @@ function sortedEntries(
     .map((k) => ({ name: k, description: obj[k] }));
 }
 
+type InventoryItem = Record<string, string | undefined>;
+
 export function collectHarnessInventory(
   harness: Harness,
 ): {
-  tools: Record<string, string>[];
-  skills: Record<string, string>[];
-  mcpServers: Record<string, string>[];
-  agents: Record<string, string>[];
+  tools: InventoryItem[];
+  skills: InventoryItem[];
+  mcpServers: InventoryItem[];
+  agents: InventoryItem[];
 } {
-  const tools: Record<string, string>[] = [];
-  const skills: Record<string, string>[] = [];
-  const mcpServers: Record<string, string>[] = [];
-  const agents: Record<string, string>[] = [];
+  const tools: InventoryItem[] = [];
+  const skills: InventoryItem[] = [];
+  const mcpServers: InventoryItem[] = [];
+  const agents: InventoryItem[] = [];
 
   try {
     if (harness === Harness.CLAUDE) {
@@ -474,36 +550,39 @@ export function collectHarnessInventory(
       agents.push(...sortedEntries(CLAUDE_AGENTS));
       const claudeHome = getClaudeHistoryPaths().home;
 
-      // Custom skills from ~/.claude/skills/
+      // 1. User skills from ~/.claude/skills/
       const skillsDir = join(claudeHome, "skills");
-      const seenSkills = new Set<string>();
       if (existsSync(skillsDir)) {
         for (const d of readdirSync(skillsDir).sort()) {
           const fullPath = join(skillsDir, d);
           if (statSync(fullPath).isDirectory()) {
-            skills.push(readSkillMetadata(fullPath) as Record<string, string>);
-            seenSkills.add(d);
+            const meta = readSkillMetadata(fullPath) as Record<string, string>;
+            meta.source = meta.source || "user";
+            skills.push(meta);
           }
         }
       }
 
-      // Marketplace plugins from settings + plugin cache
-      const settingsFile = join(claudeHome, "settings.json");
-      if (existsSync(settingsFile)) {
+      // 2. User commands from ~/.claude/commands/
+      skills.push(...collectUserCommands());
+
+      // 3. Plugin-provided skills (from installed plugin caches)
+      skills.push(...collectPluginSkills());
+
+      // 4. Marketplace plugins (the plugins themselves, not their skills)
+      const installedFile = join(claudeHome, "plugins", "installed_plugins.json");
+      if (existsSync(installedFile)) {
         try {
-          const data = JSON.parse(readFileSync(settingsFile, "utf-8"));
-          for (const pid of Object.keys(data.enabledPlugins ?? {})) {
+          const data = JSON.parse(readFileSync(installedFile, "utf-8"));
+          const plugins = data.plugins ?? {};
+          for (const [pid, entries] of Object.entries(plugins)) {
             const base = pid.split("@")[0];
-            if (base && !seenSkills.has(base)) {
-              skills.push(
-                readPluginMetadata(base) as Record<string, string>,
-              );
-              seenSkills.add(base);
-            }
+            const marketplace = pid.split("@")[1] || "unknown";
+            const meta = readPluginMetadata(base, marketplace) as Record<string, string>;
+            meta.source = "plugin";
+            skills.push(meta);
           }
-        } catch {
-          // ignore
-        }
+        } catch { /* ignore */ }
       }
     } else if (harness === Harness.GEMINI) {
       tools.push(...sortedEntries(GEMINI_TOOLS));

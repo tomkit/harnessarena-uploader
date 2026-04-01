@@ -43,7 +43,7 @@ import {
 } from "./store.js";
 import { VERSION } from "./version.js";
 import { basenameOnly, decodeClaudeProjectDir, decodeClaudeProjectDirFull } from "./helpers.js";
-import { collectHarnessInventory, collectProjectInventory } from "./batch.js";
+import { collectHarnessInventory, collectProjectInventory, collectProjectSkills } from "./batch.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -654,14 +654,18 @@ export function discoverHarnessInventory(
   for (const harness of harnesses) {
     // 1. User-level (_global) inventory
     const inv = collectHarnessInventory(harness);
-    // Separate skills into pure skills vs marketplace plugins
-    const pureSkills = inv.skills.filter((s) => !s.marketplace);
-    const userPlugins = inv.skills.filter((s) => s.marketplace);
+    // Categorize: user skills, commands, plugin-provided skills, and marketplace plugins
+    const userSkills = inv.skills.filter((s) => s.source === "user" || (!s.source && !s.marketplace));
+    const commands = inv.skills.filter((s) => s.source === "command");
+    const pluginSkills = inv.skills.filter((s) => s.source === "plugin" && !s.marketplace);
+    const plugins = inv.skills.filter((s) => s.marketplace);
     const globalData = JSON.stringify({
       scope: "user",
       tools: inv.tools,
-      skills: pureSkills,
-      plugins: userPlugins,
+      skills: userSkills,
+      commands,
+      plugin_skills: pluginSkills,
+      plugins,
       mcp_servers: inv.mcpServers,
       agents: inv.agents,
     });
@@ -682,11 +686,12 @@ export function discoverHarnessInventory(
             const projectSlug = decoded.slug;
             const realProjectDir = decoded.realPath;
             const projInv = collectProjectInventory(harness, realProjectDir);
-            if (projInv.plugins.length === 0 && projInv.mcp_servers.length === 0) continue;
+            const projSkills = collectProjectSkills(realProjectDir);
+            if (projInv.plugins.length === 0 && projInv.mcp_servers.length === 0 && projSkills.length === 0) continue;
 
             const projData = JSON.stringify({
               scope: "project",
-              skills: [],
+              skills: projSkills,
               plugins: projInv.plugins,
               mcp_servers: projInv.mcp_servers,
               agents: [],

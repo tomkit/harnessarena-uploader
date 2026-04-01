@@ -81,10 +81,10 @@ export interface HarnessMeta {
   default_model: string | null;
   plugin_version: string | null;
   config_hash: string | null;
-  available_tools: Record<string, string>[];
-  available_skills: Record<string, string>[];
-  available_mcp_servers: Record<string, string>[];
-  available_agents: Record<string, string>[];
+  available_tools: Record<string, string | undefined>[];
+  available_skills: Record<string, string | undefined>[];
+  available_mcp_servers: Record<string, string | undefined>[];
+  available_agents: Record<string, string | undefined>[];
 }
 
 export interface SubagentMeta {
