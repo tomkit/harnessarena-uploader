@@ -449,6 +449,92 @@ function readPluginMetadata(
 }
 
 /**
+ * Parse Codex config.toml for installed plugins.
+ * Format: [plugins."name@marketplace"] with enabled = true/false
+ */
+function parseTomlPlugins(content: string): Array<{name: string, marketplace: string, enabled: boolean}> {
+  const plugins: Array<{name: string, marketplace: string, enabled: boolean}> = [];
+  const pluginRegex = /\[plugins\."([^@]+)@([^"]+)"\]/g;
+  let match;
+  while ((match = pluginRegex.exec(content)) !== null) {
+    const name = match[1];
+    const marketplace = match[2];
+    // Look for enabled = true/false after the section header
+    const afterSection = content.slice(match.index + match[0].length);
+    const enabledMatch = afterSection.match(/^\s*enabled\s*=\s*(true|false)/m);
+    plugins.push({ name, marketplace, enabled: enabledMatch?.[1] === 'true' });
+  }
+  return plugins;
+}
+
+/**
+ * Discover skills provided by a Codex plugin from its cache directory.
+ * Scans ~/.codex/plugins/cache/{marketplace}/{plugin}/{hash}/skills/
+ */
+function collectCodexPluginSkills(
+  pluginName: string,
+  marketplace: string,
+  codexHome: string,
+): Array<{ name: string; description?: string; version?: string; author?: string }> {
+  const skills: Array<{ name: string; description?: string; version?: string; author?: string }> = [];
+  const cacheDir = join(codexHome, "plugins", "cache", marketplace, pluginName);
+  if (!existsSync(cacheDir)) return skills;
+
+  try {
+    const hashDirs = readdirSync(cacheDir).sort().reverse();
+    for (const hd of hashDirs) {
+      const skillsDir = join(cacheDir, hd, "skills");
+      if (!existsSync(skillsDir)) continue;
+      for (const skillName of readdirSync(skillsDir).sort()) {
+        const skillPath = join(skillsDir, skillName);
+        if (!statSync(skillPath).isDirectory()) continue;
+        const meta = readSkillMetadata(skillPath);
+        skills.push({
+          name: meta.name || skillName,
+          description: meta.description,
+          version: meta.version,
+          author: meta.author,
+        });
+      }
+      break; // only latest hash
+    }
+  } catch { /* ignore */ }
+  return skills;
+}
+
+/**
+ * Discover MCP-like app connectors from a Codex plugin cache.
+ * Looks for .app.json files in ~/.codex/plugins/cache/{marketplace}/{plugin}/{hash}/
+ */
+function collectCodexPluginApps(
+  pluginName: string,
+  marketplace: string,
+  codexHome: string,
+): string[] {
+  const apps: string[] = [];
+  const cacheDir = join(codexHome, "plugins", "cache", marketplace, pluginName);
+  if (!existsSync(cacheDir)) return apps;
+
+  try {
+    const hashDirs = readdirSync(cacheDir).sort().reverse();
+    for (const hd of hashDirs) {
+      const appJsonPath = join(cacheDir, hd, ".app.json");
+      if (existsSync(appJsonPath)) {
+        try {
+          const data = JSON.parse(readFileSync(appJsonPath, "utf-8"));
+          const appName = data.name || pluginName;
+          apps.push(appName);
+        } catch {
+          apps.push(pluginName);
+        }
+      }
+      break; // only latest hash
+    }
+  } catch { /* ignore */ }
+  return apps;
+}
+
+/**
  * Discover user commands from ~/.claude/commands/
  */
 function collectUserCommands(): Record<string, string | undefined>[] {
@@ -631,31 +717,89 @@ export function collectHarnessInventory(
         }
       }
     } else if (harness === Harness.CODEX) {
+      // Built-in tools
       for (const [name, description] of Object.entries(CODEX_TOOLS).sort(([a], [b]) => a.localeCompare(b))) {
         primitives.push({ type: 'tool', name, scope: 'built-in', source: 'standalone', description });
       }
+      // Built-in agent spawning tools
       for (const [name, description] of Object.entries(CODEX_AGENTS).sort(([a], [b]) => a.localeCompare(b))) {
         primitives.push({ type: 'agent', name, scope: 'built-in', source: 'standalone', description });
       }
-      const paths = getCodexHistoryPaths();
-      if (existsSync(paths.configPath)) {
+      // Built-in agent types
+      for (const agentType of ['default', 'explorer', 'worker']) {
+        primitives.push({ type: 'agent', name: agentType, scope: 'built-in', source: 'standalone', description: `Built-in ${agentType} agent type` });
+      }
+      // Built-in MCP server
+      primitives.push({ type: 'mcp_server', name: 'codex_apps', scope: 'built-in', source: 'standalone' });
+
+      // 1. Standalone skills from ~/.agents/skills/ (shared with Claude)
+      const agentsSkillsDir = join(homedir(), ".agents", "skills");
+      if (existsSync(agentsSkillsDir)) {
+        for (const d of readdirSync(agentsSkillsDir).sort()) {
+          const fullPath = join(agentsSkillsDir, d);
+          if (statSync(fullPath).isDirectory()) {
+            const meta = readSkillMetadata(fullPath);
+            primitives.push({
+              type: 'skill',
+              name: meta.name || d,
+              scope: 'user',
+              source: 'standalone',
+              description: meta.description,
+              version: meta.version,
+              author: meta.author,
+            });
+          }
+        }
+      }
+
+      // 2. Installed plugins from config.toml + plugin cache
+      const codexPaths = getCodexHistoryPaths();
+      if (existsSync(codexPaths.configPath)) {
         try {
-          const lines = readFileSync(paths.configPath, "utf-8").split("\n");
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (trimmed.startsWith("[plugins.")) {
-              const name = trimmed.includes('"') ? trimmed.split('"')[1] : "";
-              const base = name.split("@")[0];
-              if (base) {
-                plugins.push({
-                  name: base,
-                  marketplace: "codex",
-                  scope: 'user',
-                  enabled: true,
-                  provides_skills: [],
-                  provides_mcp_servers: [],
-                });
-              }
+          const tomlContent = readFileSync(codexPaths.configPath, "utf-8");
+          const parsedPlugins = parseTomlPlugins(tomlContent);
+          for (const pp of parsedPlugins) {
+            const pluginTag = `${pp.name}@${pp.marketplace}`;
+
+            // Discover skills from plugin cache
+            const providedSkills = collectCodexPluginSkills(pp.name, pp.marketplace, codexPaths.home);
+            // Discover app connectors (MCP-like) from plugin cache
+            const providedMcpServers = collectCodexPluginApps(pp.name, pp.marketplace, codexPaths.home);
+
+            plugins.push({
+              name: pp.name,
+              marketplace: pp.marketplace,
+              scope: 'user',
+              enabled: pp.enabled,
+              provides_skills: providedSkills.map(s => s.name),
+              provides_mcp_servers: providedMcpServers,
+            });
+
+            // Add plugin-provided skills as primitives
+            for (const skill of providedSkills) {
+              primitives.push({
+                type: 'skill',
+                name: skill.name,
+                scope: 'user',
+                source: 'plugin',
+                plugin: pluginTag,
+                marketplace: pp.marketplace,
+                description: skill.description,
+                version: skill.version,
+                author: skill.author,
+              });
+            }
+
+            // Add plugin app connectors as MCP server primitives
+            for (const appName of providedMcpServers) {
+              primitives.push({
+                type: 'mcp_server',
+                name: appName,
+                scope: 'user',
+                source: 'plugin',
+                plugin: pluginTag,
+                marketplace: pp.marketplace,
+              });
             }
           }
         } catch { /* ignore */ }
