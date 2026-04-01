@@ -570,6 +570,103 @@ export function collectHarnessInventory(
   return { tools, skills, mcpServers, agents };
 }
 
+/**
+ * Collect project-scoped inventory for a harness.
+ * Currently only Claude and Gemini have project-level config files.
+ */
+export function collectProjectInventory(
+  harness: Harness,
+  projectDir: string,
+): {
+  plugins: Record<string, string | undefined>[];
+  mcp_servers: Record<string, string | undefined>[];
+} {
+  const plugins: Record<string, string | undefined>[] = [];
+  const mcp_servers: Record<string, string | undefined>[] = [];
+
+  try {
+    if (harness === Harness.CLAUDE) {
+      // Project-scoped plugins from .claude/settings.json
+      const settingsFile = join(projectDir, ".claude", "settings.json");
+      if (existsSync(settingsFile)) {
+        try {
+          const data = JSON.parse(readFileSync(settingsFile, "utf-8"));
+          for (const [pid, _val] of Object.entries(data.enabledPlugins ?? {})) {
+            const base = pid.split("@")[0];
+            if (base) {
+              plugins.push(
+                readPluginMetadata(base) as Record<string, string>,
+              );
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      // Local overrides from .claude/settings.local.json
+      const localSettingsFile = join(projectDir, ".claude", "settings.local.json");
+      if (existsSync(localSettingsFile)) {
+        try {
+          const data = JSON.parse(readFileSync(localSettingsFile, "utf-8"));
+          const seen = new Set(plugins.map((p) => p.name));
+          for (const [pid, _val] of Object.entries(data.enabledPlugins ?? {})) {
+            const base = pid.split("@")[0];
+            if (base && !seen.has(base)) {
+              plugins.push(
+                readPluginMetadata(base) as Record<string, string>,
+              );
+              seen.add(base);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      // MCP servers from .mcp.json
+      const mcpFile = join(projectDir, ".mcp.json");
+      if (existsSync(mcpFile)) {
+        try {
+          const data = JSON.parse(readFileSync(mcpFile, "utf-8"));
+          const servers = data.mcpServers ?? data.servers ?? data;
+          if (typeof servers === "object" && servers !== null) {
+            for (const serverName of Object.keys(servers)) {
+              const cfg = servers[serverName];
+              mcp_servers.push({
+                name: serverName,
+                command: typeof cfg?.command === "string" ? cfg.command : undefined,
+              });
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+    } else if (harness === Harness.GEMINI) {
+      // Gemini project settings
+      const settingsFile = join(projectDir, ".gemini", "settings.json");
+      if (existsSync(settingsFile)) {
+        try {
+          const data = JSON.parse(readFileSync(settingsFile, "utf-8"));
+          // Gemini project settings may have extensions or tools
+          const extensions = data.extensions ?? {};
+          for (const [extName, _val] of Object.entries(extensions)) {
+            plugins.push({ name: extName });
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+    // Codex, Cursor, OpenCode: no project-level config — return empty
+  } catch {
+    // ignore
+  }
+
+  return { plugins, mcp_servers };
+}
+
 // ---------------------------------------------------------------------------
 // Harness meta
 // ---------------------------------------------------------------------------

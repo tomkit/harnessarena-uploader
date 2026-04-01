@@ -12,7 +12,7 @@ import {
 } from "./batch.js";
 import { Harness, type UploadBatch } from "./models.js";
 import { loadConfig, updateConfig, resolveSyncScope, type SyncScope } from "./store.js";
-import { discoverDeltas, runSync } from "./sync.js";
+import { discoverDeltas, discoverHarnessInventory, runSync } from "./sync.js";
 import { VERSION } from "./version.js";
 
 const ALL_HARNESSES = Object.values(Harness);
@@ -541,7 +541,9 @@ async function main(): Promise<void> {
 
   // Dry run
   if (opts.dryRun && !opts.force) {
-    const deltas = discoverDeltas(harnesses as Harness[], opts.user, projectFilter, allowedProjects.size > 0 ? allowedProjects : undefined);
+    const inventoryDeltas = discoverHarnessInventory(harnesses as Harness[], opts.user);
+    const sessionDeltas = discoverDeltas(harnesses as Harness[], opts.user, projectFilter, allowedProjects.size > 0 ? allowedProjects : undefined);
+    const deltas = [...inventoryDeltas, ...sessionDeltas];
     const totalLines = deltas.reduce((sum, d) => sum + d.lines.length, 0);
     if (totalLines === 0) {
       process.stderr.write("No new data to sync.\n");

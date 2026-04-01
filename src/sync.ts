@@ -43,7 +43,7 @@ import {
 } from "./store.js";
 import { VERSION } from "./version.js";
 import { basenameOnly, decodeClaudeProjectDir } from "./helpers.js";
-import { collectHarnessInventory } from "./batch.js";
+import { collectHarnessInventory, collectProjectInventory } from "./batch.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -635,61 +635,107 @@ async function syncProjectAliases(
 }
 
 /**
- * Collect harness inventory for sync.
- * Returns entries scoped to harness-level (_global) — native tools, agents, user-level skills.
- * Project-level skills would need per-project discovery (future).
+ * Collect harness inventory for sync as BlobDelta entries.
+ *
+ * Produces two scopes per harness:
+ *   - _global (user-level): native tools, agents, user-level skills/plugins
+ *   - per-project: project-scoped plugins and MCP servers (Claude, Gemini)
+ *
+ * Each inventory blob is uploaded as a replace-mode raw_entries row with
+ * log_type='inventory', making it queryable in the same bronze layer as
+ * session data.
  */
-function discoverHarnessInventory(
+export function discoverHarnessInventory(
   harnesses: Harness[],
   userSlug: string,
-): Array<{ userSlug: string; harness: string; projectSlug: string; tools: unknown[]; skills: unknown[]; mcpServers: unknown[]; agents: unknown[] }> {
-  const entries: Array<{ userSlug: string; harness: string; projectSlug: string; tools: unknown[]; skills: unknown[]; mcpServers: unknown[]; agents: unknown[] }> = [];
+): BlobDelta[] {
+  const deltas: BlobDelta[] = [];
+
   for (const harness of harnesses) {
+    // 1. User-level (_global) inventory
     const inv = collectHarnessInventory(harness);
-    entries.push({
-      userSlug,
-      harness,
-      projectSlug: "_global",
+    // Separate skills into pure skills vs marketplace plugins
+    const pureSkills = inv.skills.filter((s) => !s.marketplace);
+    const userPlugins = inv.skills.filter((s) => s.marketplace);
+    const globalData = JSON.stringify({
+      scope: "user",
       tools: inv.tools,
-      skills: inv.skills,
-      mcpServers: inv.mcpServers,
+      skills: pureSkills,
+      plugins: userPlugins,
+      mcp_servers: inv.mcpServers,
       agents: inv.agents,
     });
-  }
-  return entries;
-}
+    const globalKey = blobKey(userSlug, harness, "_global", "inventory", "primitives.json");
+    const globalDelta = makeReplaceDelta(globalKey, [globalData], hashContent(globalData), "_global", "inventory");
+    if (globalDelta) deltas.push(globalDelta);
 
-async function syncHarnessInventory(
-  inventory: Array<{ userSlug: string; harness: string; tools: unknown[]; skills: unknown[]; mcpServers: unknown[]; agents: unknown[] }>,
-  apiUrl: string,
-  apiKey: string,
-): Promise<void> {
-  if (inventory.length === 0) return;
+    // 2. Project-level inventory (Claude and Gemini only)
+    if (harness === Harness.CLAUDE) {
+      const paths = getClaudeHistoryPaths();
+      if (existsSync(paths.projectsDir)) {
+        try {
+          for (const projectDir of readdirSync(paths.projectsDir, { withFileTypes: true })) {
+            if (!projectDir.isDirectory()) continue;
+            const projectPath = join(paths.projectsDir, projectDir.name);
+            const projectSlug = decodeClaudeProjectDir(projectDir.name) || projectDir.name;
 
-  const body = JSON.stringify({ inventory });
-  const compressed = gzipSync(body);
+            // Claude project dirs encode the real path; we need the actual filesystem
+            // path to check for .claude/settings.json etc. The encoded dir name starts
+            // with the full path with slashes replaced by dashes. Reconstruct it.
+            const realProjectDir = projectDir.name.replace(/^-/, "/").replace(/-/g, "/");
+            const projInv = collectProjectInventory(harness, realProjectDir);
+            if (projInv.plugins.length === 0 && projInv.mcp_servers.length === 0) continue;
 
-  try {
-    const resp = await fetch(`${apiUrl}/api/v1/sync/inventory`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Encoding": "gzip",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: compressed,
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (resp.ok) {
-      const json = await resp.json() as { upserted: number };
-      process.stderr.write(`  Synced ${json.upserted} harness inventories.\n`);
-    } else {
-      process.stderr.write(`  Inventory sync failed: HTTP ${resp.status}\n`);
+            const projData = JSON.stringify({
+              scope: "project",
+              skills: [],
+              plugins: projInv.plugins,
+              mcp_servers: projInv.mcp_servers,
+              agents: [],
+            });
+            const projKey = blobKey(userSlug, harness, projectSlug, "inventory", "primitives.json");
+            const projDelta = makeReplaceDelta(projKey, [projData], hashContent(projData), projectSlug, "inventory");
+            if (projDelta) deltas.push(projDelta);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    } else if (harness === Harness.GEMINI) {
+      const paths = getGeminiHistoryPaths();
+      if (existsSync(paths.tmpDir)) {
+        try {
+          for (const projectDir of readdirSync(paths.tmpDir, { withFileTypes: true })) {
+            if (!projectDir.isDirectory()) continue;
+            // Gemini project dirs are in tmpDir; the actual project path is not easily
+            // recoverable, so we check if there's a .gemini/ config in the tmpDir entry
+            const projPath = join(paths.tmpDir, projectDir.name);
+            const projInv = collectProjectInventory(harness, projPath);
+            if (projInv.plugins.length === 0 && projInv.mcp_servers.length === 0) continue;
+
+            const projData = JSON.stringify({
+              scope: "project",
+              skills: [],
+              plugins: projInv.plugins,
+              mcp_servers: projInv.mcp_servers,
+              agents: [],
+            });
+            const projKey = blobKey(userSlug, harness, projectDir.name, "inventory", "primitives.json");
+            const projDelta = makeReplaceDelta(projKey, [projData], hashContent(projData), projectDir.name, "inventory");
+            if (projDelta) deltas.push(projDelta);
+          }
+        } catch {
+          // ignore
+        }
+      }
     }
-  } catch (err) {
-    process.stderr.write(`  Inventory sync error: ${err}\n`);
   }
+
+  return deltas;
 }
+
+// syncHarnessInventory removed — inventory now goes through the normal
+// raw_entries delta path (discoverHarnessInventory returns BlobDelta[]).
 
 // ---------------------------------------------------------------------------
 // Force clean
@@ -790,13 +836,10 @@ export async function runSync(
   if (aliases.length > 0) {
     await syncProjectAliases(aliases, apiUrl, apiKey);
   }
-  const inventory = discoverHarnessInventory(harnesses, userSlug);
-  if (inventory.length > 0) {
-    await syncHarnessInventory(inventory, apiUrl, apiKey);
-  }
-
   process.stderr.write(`Discovering deltas for: ${harnesses.join(", ")}\n`);
-  const deltas = discoverDeltas(harnesses, userSlug, projectFilter, allowedProjects)
+  const inventoryDeltas = discoverHarnessInventory(harnesses, userSlug);
+  const sessionDeltas = discoverDeltas(harnesses, userSlug, projectFilter, allowedProjects);
+  const deltas = [...inventoryDeltas, ...sessionDeltas]
     .filter((d) => d.lines.length > 0);
   result.filesScanned = deltas.length;
 
