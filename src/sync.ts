@@ -746,6 +746,7 @@ async function commitForce(
   harnesses: Harness[],
   apiUrl: string,
   apiKey: string,
+  projects?: string[],
 ): Promise<boolean> {
   process.stderr.write("Committing staged data (atomic swap)...\n");
   const resp = await fetch(`${apiUrl}/api/v1/sync`, {
@@ -754,7 +755,7 @@ async function commitForce(
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({ scope: { userSlug, harnesses } }),
+    body: JSON.stringify({ scope: { userSlug, harnesses, projects } }),
     signal: AbortSignal.timeout(120_000),
   });
   if (resp.ok) {
@@ -822,7 +823,8 @@ export async function runSync(
   const inventoryDeltas = discoverHarnessInventory(harnesses, userSlug);
   const sessionDeltas = discoverDeltas(harnesses, userSlug, projectFilter, allowedProjects);
   const deltas = [...inventoryDeltas, ...sessionDeltas]
-    .filter((d) => d.lines.length > 0);
+    .filter((d) => d.lines.length > 0)
+    .filter((d) => d.projectSlug === "_global" || !allowedProjects || allowedProjects.has(d.projectSlug));
   result.filesScanned = deltas.length;
 
   if (deltas.length === 0) {
@@ -881,7 +883,10 @@ export async function runSync(
 
   // Force mode: commit staging → production (atomic swap)
   if (force && result.errors.length === 0 && result.filesUploaded > 0) {
-    const committed = await commitForce(userSlug, harnesses, apiUrl, apiKey);
+    // Derive synced projects from the deltas to scope the commit
+    const syncedProjects = [...new Set(deltas.filter(d => d.projectSlug !== "_global").map(d => d.projectSlug))];
+    process.stderr.write(`  Scoped to ${syncedProjects.length} project(s): ${syncedProjects.join(", ") || "(all)"}\n`);
+    const committed = await commitForce(userSlug, harnesses, apiUrl, apiKey, syncedProjects.length > 0 ? syncedProjects : undefined);
     if (!committed) {
       process.stderr.write("WARNING: Staging data uploaded but commit failed. Production data unchanged.\n");
       process.stderr.write("Run --force again to retry, or the staging data will be cleaned up on next force.\n");
