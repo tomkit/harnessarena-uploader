@@ -488,6 +488,16 @@ async function main(): Promise<void> {
     opts.projects,
   );
 
+  // Build allowed projects set for history line filtering
+  const allowedProjects = new Set<string>();
+  if (opts.projects.length > 0) {
+    opts.projects.forEach((p: string) => allowedProjects.add(p));
+  } else if (config.syncScope) {
+    for (const projects of Object.values(config.syncScope)) {
+      if (Array.isArray(projects)) projects.forEach((p) => allowedProjects.add(p));
+    }
+  }
+
   if (harnesses.length === 0) {
     process.stderr.write("No harnesses to scan.\n");
     process.exit(0);
@@ -531,7 +541,7 @@ async function main(): Promise<void> {
 
   // Dry run
   if (opts.dryRun && !opts.force) {
-    const deltas = discoverDeltas(harnesses as Harness[], opts.user, projectFilter);
+    const deltas = discoverDeltas(harnesses as Harness[], opts.user, projectFilter, allowedProjects.size > 0 ? allowedProjects : undefined);
     const totalLines = deltas.reduce((sum, d) => sum + d.lines.length, 0);
     if (totalLines === 0) {
       process.stderr.write("No new data to sync.\n");
@@ -545,7 +555,7 @@ async function main(): Promise<void> {
   }
 
   // Sync (default action)
-  const result = await runSync(harnesses as Harness[], opts.user, opts.apiUrl, opts.apiKey, opts.force, projectFilter);
+  const result = await runSync(harnesses as Harness[], opts.user, opts.apiUrl, opts.apiKey, opts.force, projectFilter, allowedProjects.size > 0 ? allowedProjects : undefined);
   process.exit(result.errors.length === 0 ? 0 : 1);
 }
 

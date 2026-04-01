@@ -224,6 +224,7 @@ function makeReplaceDelta(
 
 function discoverClaudeDeltas(
   userSlug: string,
+  allowedProjects?: Set<string>,
 ): BlobDelta[] {
   const deltas: BlobDelta[] = [];
   const paths = getClaudeHistoryPaths();
@@ -277,7 +278,7 @@ function discoverClaudeDeltas(
 
   // 2. history.jsonl (append mode)
   if (existsSync(paths.historyPath)) {
-    const allLines = sanitizeClaudeHistoryFile(paths.historyPath);
+    const allLines = sanitizeClaudeHistoryFile(paths.historyPath, allowedProjects);
     const key = blobKey(userSlug, "claude", "_global", "history", "history.jsonl");
     const wm = getWatermark(key);
     const { newLines, lastLineHash, lastLineNumber } = computeAppendDelta(allLines, wm?.mode === "append" ? wm : null);
@@ -412,6 +413,7 @@ export function discoverDeltas(
   harnesses: Harness[],
   userSlug: string,
   projectFilter?: ProjectFilter,
+  allowedProjects?: Set<string>,
 ): BlobDelta[] {
   const pf = projectFilter ?? (() => true);
   const allDeltas: BlobDelta[] = [];
@@ -419,7 +421,7 @@ export function discoverDeltas(
   for (const harness of harnesses) {
     let deltas: BlobDelta[];
     switch (harness) {
-      case Harness.CLAUDE: deltas = discoverClaudeDeltas(userSlug); break;
+      case Harness.CLAUDE: deltas = discoverClaudeDeltas(userSlug, allowedProjects); break;
       case Harness.CODEX: deltas = discoverCodexDeltas(userSlug); break;
       case Harness.GEMINI: deltas = discoverGeminiDeltas(userSlug); break;
       case Harness.AGENT: deltas = discoverCursorDeltas(userSlug); break;
@@ -754,6 +756,7 @@ export async function runSync(
   apiKey: string,
   force = false,
   projectFilter?: ProjectFilter,
+  allowedProjects?: Set<string>,
 ): Promise<SyncResult> {
   if (force) {
     // Clean up any leftover staging from a previous interrupted force
@@ -793,7 +796,7 @@ export async function runSync(
   }
 
   process.stderr.write(`Discovering deltas for: ${harnesses.join(", ")}\n`);
-  const deltas = discoverDeltas(harnesses, userSlug, projectFilter)
+  const deltas = discoverDeltas(harnesses, userSlug, projectFilter, allowedProjects)
     .filter((d) => d.lines.length > 0);
   result.filesScanned = deltas.length;
 

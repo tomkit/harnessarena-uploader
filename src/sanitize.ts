@@ -431,13 +431,18 @@ export function sanitizeClaudeJsonlFile(filePath: string): string[] {
 /**
  * Sanitize a Claude history.jsonl file. Returns sanitized lines.
  */
-export function sanitizeClaudeHistoryFile(filePath: string): string[] {
+export function sanitizeClaudeHistoryFile(filePath: string, allowedProjects?: Set<string>): string[] {
   if (!existsSync(filePath)) return [];
   const lines: string[] = [];
   for (const line of readFileSync(filePath, "utf-8").split("\n")) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
+      // Filter by project if allowedProjects is set
+      if (allowedProjects && entry.project) {
+        const slug = entry.project.split("/").pop() || "";
+        if (!allowedProjects.has(slug)) continue;
+      }
       lines.push(JSON.stringify(sanitizeClaudeHistoryEntry(entry)));
     } catch {
       continue;
