@@ -29,6 +29,7 @@ import {
   sanitizeCodexThreadsDb,
   sanitizeCodexSpawnEdges,
   extractCodexThreadProjectMap,
+  extractCodexProjectPaths,
   sanitizeGeminiSessionFile,
   sanitizeCursorDb,
   sanitizeOpenCodeDb,
@@ -411,6 +412,109 @@ function discoverOpenCodeDeltas(
 // Public API
 // ---------------------------------------------------------------------------
 
+/** A project found on the local filesystem. */
+export interface LocalProject {
+  name: string;
+  harness: Harness;
+  path: string | null;
+  /** If the folder name differs from the project name in manifest files */
+  manifestName: string | null;
+}
+
+/**
+ * Detect the "real" project name from manifest files (package.json, Cargo.toml, etc.).
+ * Returns null if the manifest name matches the folder name or no manifest is found.
+ */
+function detectManifestName(projectPath: string, folderName: string): string | null {
+  if (!projectPath || !existsSync(projectPath)) return null;
+  try {
+    // package.json
+    const pkgPath = join(projectPath, "package.json");
+    if (existsSync(pkgPath)) {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+      if (pkg.name && typeof pkg.name === "string") {
+        const name = pkg.name.replace(/^@[^/]+\//, ""); // strip npm scope
+        if (name !== folderName) return name;
+      }
+      return null;
+    }
+    // Cargo.toml — look for name = "..."
+    const cargoPath = join(projectPath, "Cargo.toml");
+    if (existsSync(cargoPath)) {
+      const content = readFileSync(cargoPath, "utf-8");
+      const match = content.match(/^\s*name\s*=\s*"([^"]+)"/m);
+      if (match && match[1] !== folderName) return match[1];
+      return null;
+    }
+    // pyproject.toml — look for name = "..."
+    const pyPath = join(projectPath, "pyproject.toml");
+    if (existsSync(pyPath)) {
+      const content = readFileSync(pyPath, "utf-8");
+      const match = content.match(/^\s*name\s*=\s*"([^"]+)"/m);
+      if (match && match[1] !== folderName) return match[1];
+      return null;
+    }
+    // go.mod — look for module path
+    const goPath = join(projectPath, "go.mod");
+    if (existsSync(goPath)) {
+      const content = readFileSync(goPath, "utf-8");
+      const match = content.match(/^module\s+(\S+)/m);
+      if (match) {
+        const modName = match[1].split("/").pop() ?? "";
+        if (modName && modName !== folderName) return modName;
+      }
+      return null;
+    }
+  } catch { /* ignore read errors */ }
+  return null;
+}
+
+/**
+ * Scan the filesystem for all projects across selected harnesses.
+ * Does NOT check watermarks — returns everything that exists.
+ */
+export function discoverProjects(harnesses: Harness[]): LocalProject[] {
+  const projects: LocalProject[] = [];
+  const seen = new Set<string>();
+
+  for (const harness of harnesses) {
+    let entries: Array<{ name: string; path: string | null }> = [];
+    switch (harness) {
+      case Harness.CLAUDE: {
+        const paths = getClaudeHistoryPaths();
+        if (existsSync(paths.projectsDir)) {
+          entries = readdirSync(paths.projectsDir, { withFileTypes: true })
+            .filter((d) => d.isDirectory())
+            .map((d) => {
+              const decoded = decodeClaudeProjectDirFull(d.name);
+              return { name: decoded?.slug ?? d.name, path: decoded?.realPath ?? null };
+            });
+        }
+        break;
+      }
+      case Harness.CODEX: {
+        const paths = getCodexHistoryPaths();
+        if (existsSync(paths.stateDbPath)) {
+          // Extract slug → cwd mapping from threads DB
+          const slugToCwd = extractCodexProjectPaths(paths.stateDbPath);
+          entries = [...slugToCwd.entries()].map(([name, cwd]) => ({ name, path: cwd }));
+        }
+        break;
+      }
+    }
+    for (const entry of entries) {
+      const key = `${harness}:${entry.name}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        const manifestName = entry.path ? detectManifestName(entry.path, entry.name) : null;
+        projects.push({ name: entry.name, harness, path: entry.path, manifestName });
+      }
+    }
+  }
+
+  return projects.sort((a, b) => a.name.localeCompare(b.name) || a.harness.localeCompare(b.harness));
+}
+
 /**
  * Discover all deltas across selected harnesses, filtered by project scope.
  */
@@ -435,8 +539,8 @@ export function discoverDeltas(
       case Harness.OPENCODE: deltas = discoverOpenCodeDeltas(userSlug); break;
       default: deltas = [];
     }
-    // Apply project filter. _harness projects always pass (harness-level config data).
-    allDeltas.push(...deltas.filter((d) => d.projectSlug === "_harness" || pf(harness, d.projectSlug)));
+    // Filter to user-facing projects only (harness-level data handled internally by runSync)
+    allDeltas.push(...deltas.filter((d) => d.projectSlug !== "_harness" && pf(harness, d.projectSlug)));
   }
 
   return allDeltas;
@@ -810,8 +914,7 @@ export async function runSync(
   const inventoryDeltas = discoverHarnessInventory(harnesses, userSlug);
   const sessionDeltas = discoverDeltas(harnesses, userSlug, projectFilter, allowedProjects);
   const deltas = [...inventoryDeltas, ...sessionDeltas]
-    .filter((d) => d.lines.length > 0)
-    .filter((d) => d.projectSlug === "_harness" || !allowedProjects || allowedProjects.has(d.projectSlug));
+    .filter((d) => d.lines.length > 0);
   result.filesScanned = deltas.length;
 
   if (deltas.length === 0) {

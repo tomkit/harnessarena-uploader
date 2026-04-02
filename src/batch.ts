@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import Database from "better-sqlite3";
 
-import { machineId, utcnowIso } from "./helpers.js";
 import {
   getClaudeHistoryPaths,
   getCodexHistoryPaths,
@@ -14,18 +13,12 @@ import {
 } from "./history-paths.js";
 import {
   Harness,
-  createUploadBatch,
   type HarnessMeta,
-  type SessionMeta,
-  type UploadBatch,
   type Primitive,
   type PluginEntry,
   type InventoryBlob,
   type PrimitiveScope,
 } from "./models.js";
-import { PARSERS } from "./parsers/index.js";
-import { VERSION } from "./version.js";
-import { randomUUID } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Version detection
@@ -1182,154 +1175,6 @@ function readdirRecursive(dir: string, suffix: string): string[] {
     // ignore permission errors etc.
   }
   return results;
-}
-
-// ---------------------------------------------------------------------------
-// Build batch
-// ---------------------------------------------------------------------------
-
-export function buildBatch(
-  harnesses: Harness[],
-  since?: Date,
-): UploadBatch | null {
-  let allSessions: SessionMeta[] = [];
-
-  // Resolve versions first so parsers can use them
-  const harnessVersions: Partial<Record<Harness, string>> = {};
-  const harnessMetasList: HarnessMeta[] = [];
-  for (const harness of harnesses) {
-    try {
-      const meta = collectHarnessMeta(harness);
-      harnessVersions[harness] = meta.cli_version;
-      harnessMetasList.push(meta);
-    } catch (e) {
-      process.stderr.write(`  ${harness}: skipped (${e})\n`);
-      continue;
-    }
-  }
-
-  for (const harness of harnesses) {
-    if (!(harness in harnessVersions)) continue;
-    const parser = PARSERS[harness];
-    if (parser) {
-      const sessions = parser.parse(since);
-      // Fill in harness_version for sessions that don't have it
-      const patched: SessionMeta[] = [];
-      for (const s of sessions) {
-        if (!s.harness_version || !s.harness_version.trim()) {
-          patched.push({
-            ...s,
-            harness_version: harnessVersions[harness]!,
-          });
-        } else {
-          patched.push(s);
-        }
-      }
-      allSessions.push(...patched);
-      process.stderr.write(
-        `  ${harness}: found ${patched.length} session(s)\n`,
-      );
-    }
-  }
-
-  if (allSessions.length === 0) return null;
-
-  // Final validation
-  for (const s of allSessions) {
-    if (!s.harness_version) {
-      throw new Error(
-        `Session ${s.source_session_id} (${s.harness}) has no harness_version ` +
-          `after resolution. This is a bug.`,
-      );
-    }
-  }
-
-  return createUploadBatch({
-    id: randomUUID(),
-    tool_version: VERSION,
-    harnesses_scanned: harnesses,
-    harness_meta: harnessMetasList,
-    sessions: allSessions,
-    machine_id: machineId(),
-    created_at: utcnowIso(),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Serialize
-// ---------------------------------------------------------------------------
-
-export function serializeBatch(batch: UploadBatch): Record<string, unknown> {
-  // The TS interfaces are already plain objects; just return a deep copy
-  return JSON.parse(JSON.stringify(batch));
-}
-
-// ---------------------------------------------------------------------------
-// List projects
-// ---------------------------------------------------------------------------
-
-export interface ProjectRow {
-  name: string;
-  harnesses: Harness[];
-  sessionCount: number;
-  completeness: string;
-}
-
-function summarizeCompleteness(levels: Set<string>): string {
-  const order = ["full", "partial", "prompts_only"];
-  const present = order.filter((l) => levels.has(l));
-  return present.length > 0 ? present.join("+") : "unknown";
-}
-
-export function listProjects(batch: UploadBatch): ProjectRow[] {
-  const projects = new Map<
-    string,
-    { harnesses: Set<Harness>; sessionCount: number; completeness: Set<string> }
-  >();
-
-  for (const session of batch.sessions) {
-    if (!session.project_name) continue;
-    let entry = projects.get(session.project_name);
-    if (!entry) {
-      entry = { harnesses: new Set(), sessionCount: 0, completeness: new Set() };
-      projects.set(session.project_name, entry);
-    }
-    entry.harnesses.add(session.harness);
-    entry.completeness.add(session.data_completeness || "full");
-    entry.sessionCount += 1;
-  }
-
-  const rows: ProjectRow[] = [];
-  for (const [name, entry] of [...projects.entries()].sort((a, b) =>
-    a[0].localeCompare(b[0]),
-  )) {
-    rows.push({
-      name,
-      harnesses: [...entry.harnesses].sort((a, b) => a.localeCompare(b)),
-      sessionCount: entry.sessionCount,
-      completeness: summarizeCompleteness(entry.completeness),
-    });
-  }
-  return rows;
-}
-
-export function filterBatchProjects(
-  batch: UploadBatch,
-  selectedProjects: Set<string>,
-): UploadBatch | null {
-  const sessions = batch.sessions.filter(
-    (s) => s.project_name != null && selectedProjects.has(s.project_name),
-  );
-  if (sessions.length === 0) return null;
-  return createUploadBatch({
-    id: randomUUID(),
-    tool_version: batch.tool_version,
-    harnesses_scanned: batch.harnesses_scanned,
-    harness_meta: batch.harness_meta,
-    sessions,
-    machine_id: batch.machine_id,
-    created_at: utcnowIso(),
-  });
 }
 
 export function detectHarnessInstalled(harness: Harness): boolean {

@@ -10,8 +10,22 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const STORE_DIR = join(homedir(), ".harnessarena");
-const CONFIG_PATH = join(STORE_DIR, "config.json");
 const WATERMARKS_PATH = join(STORE_DIR, "watermarks.json");
+
+let _devMode = false;
+
+/** Set dev mode — must be called before any config reads. Switches to config.local.json. */
+export function setDevMode(dev: boolean): void {
+  _devMode = dev;
+}
+
+export function isDevMode(): boolean {
+  return _devMode;
+}
+
+function configPath(): string {
+  return join(STORE_DIR, _devMode ? "config.local.json" : "config.json");
+}
 
 function ensureDir(): void {
   if (!existsSync(STORE_DIR)) {
@@ -53,9 +67,7 @@ export type SyncScope = Record<string, string[] | false>;
 export interface Config {
   /** API key for harnessarena.com */
   apiKey?: string;
-  /** API base URL */
-  apiUrl?: string;
-  /** User slug (display name or username) */
+  /** User slug (GitHub username, set during login) */
   userSlug?: string;
   /** Per-harness project sync scope. Written by wizard, editable by user. */
   syncScope?: SyncScope;
@@ -117,11 +129,11 @@ export function resolveSyncScope(
 }
 
 export function loadConfig(): Config {
-  return readJson<Config>(CONFIG_PATH, {});
+  return readJson<Config>(configPath(), {});
 }
 
 export function saveConfig(config: Config): void {
-  writeJson(CONFIG_PATH, config);
+  writeJson(configPath(), config);
 }
 
 export function updateConfig(partial: Partial<Config>): Config {
@@ -180,7 +192,15 @@ export function saveWatermarks(watermarks: WatermarkStore): void {
   writeJson(WATERMARKS_PATH, watermarks);
 }
 
+let _ignoreWatermarks = false;
+
+/** Temporarily ignore all watermarks (for force preview dry runs). */
+export function setIgnoreWatermarks(ignore: boolean): void {
+  _ignoreWatermarks = ignore;
+}
+
 export function getWatermark(key: string): Watermark | null {
+  if (_ignoreWatermarks) return null;
   const watermarks = loadWatermarks();
   return watermarks[key] ?? null;
 }

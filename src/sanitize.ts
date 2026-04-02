@@ -531,6 +531,29 @@ export function extractCodexThreadProjectMap(dbPath: string): Map<string, string
   }
 }
 
+/** Extract project slug → cwd path mapping from Codex threads DB. */
+export function extractCodexProjectPaths(dbPath: string): Map<string, string> {
+  if (!existsSync(dbPath)) return new Map();
+  try {
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db.prepare("SELECT cwd FROM threads").all() as { cwd: string }[];
+    db.close();
+    const map = new Map<string, string>();
+    for (const row of rows) {
+      if (row.cwd) {
+        const cwd = row.cwd.replace(/[/\\]+$/, "");
+        const slug = basename(cwd) || "_unknown";
+        if (slug !== "_harness" && !map.has(slug)) {
+          map.set(slug, cwd);
+        }
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
 /**
  * Sanitize a Codex rollout JSONL file. Returns sanitized lines.
  */
