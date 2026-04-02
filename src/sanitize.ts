@@ -90,9 +90,24 @@ export function sanitizeClaudeEntry(entry: Record<string, unknown>): Record<stri
                 ...(rawInput.description ? { description: rawInput.description } : {}),
                 ...(rawInput.run_in_background ? { run_in_background: rawInput.run_in_background } : {}),
               };
-            } else if (toolName === "Bash" && rawInput.description) {
-              // Preserve the Claude-generated description (not the command itself)
-              sanitizedInput = { description: rawInput.description };
+            } else if (toolName === "Bash") {
+              if (rawInput.description) sanitizedInput.description = rawInput.description;
+            } else if (toolName === "Edit" || toolName === "Read" || toolName === "Write") {
+              // Preserve only the filename (basename), not the full path
+              const fp = rawInput.file_path as string | undefined;
+              if (fp) sanitizedInput.file = fp.split("/").pop() ?? "";
+              if (toolName === "Edit" && rawInput.replace_all) sanitizedInput.replace_all = true;
+            } else if (toolName === "Glob") {
+              if (rawInput.pattern) sanitizedInput.pattern = rawInput.pattern;
+            } else if (toolName === "Grep") {
+              if (rawInput.pattern) sanitizedInput.pattern = rawInput.pattern;
+              if (rawInput.output_mode) sanitizedInput.output_mode = rawInput.output_mode;
+            } else if (toolName === "ToolSearch") {
+              if (rawInput.query) sanitizedInput.query = rawInput.query;
+            } else if (toolName === "TaskCreate") {
+              if (rawInput.description) sanitizedInput.description = rawInput.description;
+            } else if (toolName === "TaskUpdate") {
+              if (rawInput.status) sanitizedInput.status = rawInput.status;
             }
             return {
               type: "tool_use",
