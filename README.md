@@ -1,378 +1,155 @@
-# HarnessArena Uploader
+# Harness Arena Uploader
 
-Upload your AI coding harness usage stats to [HarnessArena](https://harnessarena.com). **No conversation content is ever sent** — only anonymous metadata like token counts, model names, and session durations.
+Sync AI coding harness session metadata to [Harness Arena](https://harnessarena.com). Only aggregated metrics are uploaded by default; raw session content requires full-data mode. All uploaded data can be exported or permanently deleted at any time.
 
 ## Supported Harnesses
 
-| Harness        | Binary   | Status |
-| -------------- | -------- | ------ |
-| Claude Code    | `claude` | ✅     |
-| Codex (OpenAI) | `codex`  | ✅     |
+| Harness        | Binary   | Status      |
+| -------------- | -------- | ----------- |
+| Claude Code    | `claude` | Supported   |
+| Codex (OpenAI) | `codex`  | Supported   |
+| Gemini CLI     | `gemini` | Coming soon |
+| Cursor Agent   | `agent`  | Coming soon |
+| OpenCode       | `opencode` | Coming soon |
 
 ## Quick Start
 
 ```bash
-# Upload with the universal one-liner
-curl -fsSL https://raw.githubusercontent.com/tomkit/harnessarena-uploader/main/harnessarena_uploader.sh | bash -s -- --api-key YOUR_API_KEY
-
-# Download and run locally (no dependencies required)
-curl -fsSL https://raw.githubusercontent.com/tomkit/harnessarena-uploader/main/harnessarena_uploader.py -o harnessarena_uploader.py
-
-# Start the interactive wizard locally
-python3 harnessarena_uploader.py
-
-# Upload only specific harnesses
-python3 harnessarena_uploader.py --harness claude --harness gemini
-
-# List unique projects from selected harnesses
-python3 harnessarena_uploader.py --harness claude --harness codex --list-projects
-
-# Fold multiple project names under one alias before listing/uploading
-python3 harnessarena_uploader.py --alias speeding-ticket-fighter=ticketfight-ai --list-projects
-
-# Only sessions after a specific date
-python3 harnessarena_uploader.py --since 2026-03-01
+# Clone and run
+git clone https://github.com/harnessarena/uploader.git
+cd uploader
+./harnessarena_uploader.sh
 ```
 
-By default, the script starts an interactive wizard when run in a real terminal with no selection flags. The wizard:
+On first run, the CLI will open your browser to sign in via GitHub. After authentication, it enters the interactive wizard to select harnesses and projects, then syncs.
 
-- detects likely-installed harnesses
-- lets you choose which harnesses to scan
-- shows the project table and lets you choose projects
-- optionally lets you fold projects together with aliases
-- confirms before upload
+Subsequent runs sync incrementally (only new data since last sync).
 
-Use `--no-wizard` to force flag-driven mode.
+## Authentication
 
-## What Gets Uploaded (Safe Metadata Only)
+The CLI uses a device authorization flow (RFC 8628):
 
-- ✅ Session ID (hashed, non-reversible)
-- ✅ Harness name and version
-- ✅ Project name (basename only, e.g. "my-app" not "/Users/you/Projects/my-app")
-- ✅ Git repo name and branch
-- ✅ Model used and provider
-- ✅ Token counts (input, output, cached, total)
-- ✅ Message counts (user vs assistant)
-- ✅ Tool call names and counts
-- ✅ Session duration
-- ✅ Cost (if available)
-
-## What is NEVER Uploaded (Private)
-
-- ❌ Message content (your prompts and responses)
-- ❌ Code snippets or file contents
-- ❌ Full file paths
-- ❌ API keys or credentials
-- ❌ Tool call arguments or results
-
-## Project Selection
-
-Use `--harness` to select which harness histories to scan. Repeat it to include multiple harnesses:
+1. Run `login` — the CLI generates a short code and opens your browser
+2. Sign in with GitHub and enter the code to approve
+3. An API key is saved locally in `~/.harnessarena/config.json`
 
 ```bash
-python3 harnessarena_uploader.py --harness claude --harness codex --dry-run
+./harnessarena_uploader.sh login         # production
+./harnessarena_uploader.sh login --dev   # local dev server
+./harnessarena_uploader.sh logout        # remove saved API key
 ```
 
-Use `--list-projects` to print the unique project names seen in the selected harnesses and exit. Output is shown as an aligned terminal table with these columns:
+Production and development use separate config files (`config.json` and `config.local.json`). Watermarks are shared.
 
-```text
-PROJECT  HARNESSES  SESSIONS  COMPLETENESS
-```
+## Commands
 
-Completeness values:
+### sync (default)
 
-- `full`: project has at least one full session history record
-- `partial`: project was recovered only from lightweight metadata/index records
-- `prompts_only`: project was recovered only from prompt-history supplements
-- `full+partial`, `full+prompts_only`, `partial+prompts_only`, `full+partial+prompts_only`: mixed evidence across retained history sources
-
-Example:
+Sync session metadata. This is the default command when no subcommand is specified.
 
 ```bash
-python3 harnessarena_uploader.py --harness claude --harness codex --list-projects
+# Incremental sync (only new data)
+./harnessarena_uploader.sh
+
+# Interactive wizard (select harnesses + projects)
+./harnessarena_uploader.sh sync -i
+
+# Dry run — show what would sync
+./harnessarena_uploader.sh sync -n
+
+# List discovered projects
+./harnessarena_uploader.sh sync -l
+
+# Sync specific harnesses only
+./harnessarena_uploader.sh sync -H claude
+
+# Sync specific projects only
+./harnessarena_uploader.sh sync -p harnessarena-uploader -p vibing-history
+
+# Force re-sync (replaces server data)
+./harnessarena_uploader.sh sync -f
 ```
 
-Use `--alias OLD=NEW` to fold multiple project names under one canonical project name before listing or uploading:
+Force sync shows a preview comparing client vs server line counts before proceeding. If the server has more data than the client (e.g., because the harness pruned local logs), a warning is displayed.
+
+### login / logout
 
 ```bash
-python3 harnessarena_uploader.py \
-  --harness claude \
-  --harness codex \
-  --alias speeding-ticket-fighter=ticketfight-ai \
-  --alias ticketfight-web=ticketfight-ai \
-  --list-projects
-```
-
-For a zero-install project listing flow, the same flags work through the universal one-liner:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/tomkit/harnessarena-uploader/main/harnessarena_uploader.sh \
-  | bash -s -- --harness claude --harness codex --list-projects
-```
-
-## History Locations
-
-The uploader reads each harness's local history files from standard locations by default.
-
-### Codex
-
-Codex history defaults to:
-
-```text
-~/.codex/config.toml
-~/.codex/state_5.sqlite
-~/.codex/sessions/
-```
-
-You can override where the uploader reads Codex history from with environment variables.
-
-Override precedence:
-
-1. `HARNESSARENA_CODEX_CONFIG_PATH`
-2. `HARNESSARENA_CODEX_STATE_DB_PATH`
-3. `HARNESSARENA_CODEX_SESSIONS_DIR`
-4. `HARNESSARENA_CODEX_HOME`
-5. `CODEX_HOME`
-6. default `~/.codex`
-
-Variable defaults when unset:
-
-```text
-HARNESSARENA_CODEX_CONFIG_PATH  -> ${HARNESSARENA_CODEX_HOME:-${CODEX_HOME:-~/.codex}}/config.toml
-HARNESSARENA_CODEX_STATE_DB_PATH -> ${HARNESSARENA_CODEX_HOME:-${CODEX_HOME:-~/.codex}}/state_5.sqlite
-HARNESSARENA_CODEX_SESSIONS_DIR -> ${HARNESSARENA_CODEX_HOME:-${CODEX_HOME:-~/.codex}}/sessions
-HARNESSARENA_CODEX_HOME        -> ${CODEX_HOME:-~/.codex}
-CODEX_HOME                     -> ~/.codex
-```
-
-Examples:
-
-```bash
-# Point the uploader at an alternate Codex home
-export HARNESSARENA_CODEX_HOME=/Volumes/data/custom-codex
-python3 harnessarena_uploader.py --harness codex --dry-run
-```
-
-```bash
-# Override individual Codex paths
-export HARNESSARENA_CODEX_CONFIG_PATH=~/tmp/codex/config.toml
-export HARNESSARENA_CODEX_STATE_DB_PATH=~/tmp/codex/state_5.sqlite
-export HARNESSARENA_CODEX_SESSIONS_DIR=~/tmp/codex/sessions
-python3 harnessarena_uploader.py --harness codex --dry-run
-```
-
-### Claude Code
-
-Claude Code history defaults to:
-
-```text
-~/.claude/projects/
-~/.claude/history.jsonl
-~/.claude/session-env/
-~/Library/Application Support/Claude/claude-code-sessions/
-```
-
-You can override where the uploader reads Claude Code history from with environment variables.
-
-Override precedence:
-
-1. `HARNESSARENA_CLAUDE_PROJECTS_DIR`
-2. `HARNESSARENA_CLAUDE_HISTORY_PATH`
-3. `HARNESSARENA_CLAUDE_SESSION_ENV_DIR`
-4. `HARNESSARENA_CLAUDE_APP_SESSIONS_DIR`
-5. `HARNESSARENA_CLAUDE_HOME`
-6. default `~/.claude`
-
-Variable defaults when unset:
-
-```text
-HARNESSARENA_CLAUDE_PROJECTS_DIR   -> ${HARNESSARENA_CLAUDE_HOME:-~/.claude}/projects
-HARNESSARENA_CLAUDE_HISTORY_PATH   -> ${HARNESSARENA_CLAUDE_HOME:-~/.claude}/history.jsonl
-HARNESSARENA_CLAUDE_SESSION_ENV_DIR -> ${HARNESSARENA_CLAUDE_HOME:-~/.claude}/session-env
-HARNESSARENA_CLAUDE_APP_SESSIONS_DIR -> ~/Library/Application Support/Claude/claude-code-sessions
-HARNESSARENA_CLAUDE_HOME           -> ~/.claude
-```
-
-Examples:
-
-```bash
-# Point the uploader at an alternate Claude home
-export HARNESSARENA_CLAUDE_HOME=/Volumes/data/custom-claude
-python3 harnessarena_uploader.py --harness claude --dry-run
-```
-
-```bash
-# Override individual Claude paths
-export HARNESSARENA_CLAUDE_PROJECTS_DIR=~/tmp/claude/projects
-export HARNESSARENA_CLAUDE_HISTORY_PATH=~/tmp/claude/history.jsonl
-export HARNESSARENA_CLAUDE_SESSION_ENV_DIR=~/tmp/claude/session-env
-export HARNESSARENA_CLAUDE_APP_SESSIONS_DIR=~/tmp/claude/claude-code-sessions
-python3 harnessarena_uploader.py --harness claude --dry-run
-```
-
-### Gemini CLI
-
-Gemini history defaults to:
-
-```text
-~/.gemini/tmp/
-~/.gemini/skills/
-~/.agents/skills/
-```
-
-You can override where the uploader reads Gemini history and skill metadata from with environment variables.
-
-Override precedence:
-
-1. `HARNESSARENA_GEMINI_TMP_DIR`
-2. `HARNESSARENA_GEMINI_SKILLS_DIR`
-3. `HARNESSARENA_AGENTS_SKILLS_DIR`
-4. `HARNESSARENA_GEMINI_HOME`
-5. default `~/.gemini`
-
-Variable defaults when unset:
-
-```text
-HARNESSARENA_GEMINI_TMP_DIR      -> ${HARNESSARENA_GEMINI_HOME:-~/.gemini}/tmp
-HARNESSARENA_GEMINI_SKILLS_DIR   -> ${HARNESSARENA_GEMINI_HOME:-~/.gemini}/skills
-HARNESSARENA_AGENTS_SKILLS_DIR   -> ~/.agents/skills
-HARNESSARENA_GEMINI_HOME         -> ~/.gemini
-```
-
-Examples:
-
-```bash
-# Point the uploader at an alternate Gemini home
-export HARNESSARENA_GEMINI_HOME=/Volumes/data/custom-gemini
-python3 harnessarena_uploader.py --harness gemini --dry-run
-```
-
-```bash
-# Override individual Gemini paths
-export HARNESSARENA_GEMINI_TMP_DIR=~/tmp/gemini/tmp
-export HARNESSARENA_GEMINI_SKILLS_DIR=~/tmp/gemini/skills
-export HARNESSARENA_AGENTS_SKILLS_DIR=~/tmp/agents/skills
-python3 harnessarena_uploader.py --harness gemini --dry-run
-```
-
-### Cursor Agent
-
-Cursor Agent history defaults to:
-
-```text
-~/.cursor/chats/
-```
-
-You can override where the uploader reads Cursor Agent history from with environment variables.
-
-Override precedence:
-
-1. `HARNESSARENA_CURSOR_CHATS_DIR`
-2. `HARNESSARENA_CURSOR_HOME`
-3. default `~/.cursor`
-
-Variable defaults when unset:
-
-```text
-HARNESSARENA_CURSOR_CHATS_DIR    -> ${HARNESSARENA_CURSOR_HOME:-~/.cursor}/chats
-HARNESSARENA_CURSOR_HOME         -> ~/.cursor
-```
-
-Examples:
-
-```bash
-# Point the uploader at an alternate Cursor home
-export HARNESSARENA_CURSOR_HOME=/Volumes/data/custom-cursor
-python3 harnessarena_uploader.py --harness agent --dry-run
-```
-
-```bash
-# Override the Cursor chats directory directly
-export HARNESSARENA_CURSOR_CHATS_DIR=~/tmp/cursor/chats
-python3 harnessarena_uploader.py --harness agent --dry-run
-```
-
-### OpenCode
-
-OpenCode history defaults to:
-
-```text
-~/.local/share/opencode/opencode.db
-~/.config/opencode/package.json
-```
-
-You can override where the uploader reads OpenCode history and install metadata from with environment variables.
-
-Override precedence:
-
-1. `HARNESSARENA_OPENCODE_DB_PATH`
-2. `HARNESSARENA_OPENCODE_PACKAGE_JSON_PATH`
-3. `HARNESSARENA_OPENCODE_CONFIG_DIR`
-4. `HARNESSARENA_OPENCODE_HOME`
-5. default `~/.local/share/opencode`
-
-Variable defaults when unset:
-
-```text
-HARNESSARENA_OPENCODE_DB_PATH            -> ${HARNESSARENA_OPENCODE_HOME:-~/.local/share/opencode}/opencode.db
-HARNESSARENA_OPENCODE_PACKAGE_JSON_PATH  -> ${HARNESSARENA_OPENCODE_CONFIG_DIR:-~/.config/opencode}/package.json
-HARNESSARENA_OPENCODE_CONFIG_DIR         -> ~/.config/opencode
-HARNESSARENA_OPENCODE_HOME               -> ~/.local/share/opencode
-```
-
-Examples:
-
-```bash
-# Point the uploader at an alternate OpenCode data directory
-export HARNESSARENA_OPENCODE_HOME=/Volumes/data/custom-opencode
-python3 harnessarena_uploader.py --harness opencode --dry-run
-```
-
-```bash
-# Override individual OpenCode paths
-export HARNESSARENA_OPENCODE_DB_PATH=~/tmp/opencode/opencode.db
-export HARNESSARENA_OPENCODE_CONFIG_DIR=~/tmp/opencode-config
-export HARNESSARENA_OPENCODE_PACKAGE_JSON_PATH=~/tmp/opencode-config/package.json
-python3 harnessarena_uploader.py --harness opencode --dry-run
-```
-
-## Auditing
-
-This is a single Python file with zero dependencies. Read it before running:
-
-```bash
-# View the source (~1000 lines)
-less harnessarena_uploader.py
-
-# Or check the hash
-sha256sum harnessarena_uploader.py
-```
-
-If you use the universal one-liner, the shell bootstrap is also tiny and auditable:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/tomkit/harnessarena-uploader/main/harnessarena_uploader.sh
+./harnessarena_uploader.sh login         # sign in via GitHub
+./harnessarena_uploader.sh logout        # remove API key
 ```
 
 ## CLI Reference
 
 ```
-usage: harnessarena_uploader.py [-h] [--harness {claude,gemini,codex,agent,opencode,all}]
-                                 [--since YYYY-MM-DD] [--dry-run] [--api-key API_KEY]
-                                 [--api-url API_URL] [--alias OLD=NEW] [--list-projects]
-                                 [--no-wizard] [--version]
+Usage: harnessarena-uploader [options] [command]
 
-Options:
-  --harness NAME    Only scan specific harnesses (can repeat)
-  --since DATE      Only include sessions after YYYY-MM-DD
-  --dry-run         Show what would be uploaded without sending
-  --api-key KEY     API key for harnessarena.com
-  --api-url URL     API base URL (default: https://harnessarena.com)
-  --alias OLD=NEW   Fold one project name into another before listing/upload
-  --list-projects   List unique projects found in the selected harnesses and exit
-  --no-wizard       Disable the interactive wizard and use flag-driven mode
-  --version         Show version and exit
+Commands:
+  login [options]   Sign in via browser (GitHub OAuth)
+  logout [options]  Remove saved API key and sign out
+  sync [options]    Sync session metadata to Harness Arena
+
+Sync options:
+  -H, --harness <name>   Harnesses to scan (repeatable)
+  -p, --projects <name>  Projects to sync (repeatable)
+  -d, --dev              Use local dev server (localhost:3000)
+  -n, --dry-run          Show what would sync without uploading
+  -l, --list-projects    List discovered projects and exit
+  -i, --interactive      Run the interactive wizard
+  -f, --force            Force re-sync: stage then atomically swap
+  -v, --version          Show version
+  -h, --help             Show help
 ```
+
+## What Gets Uploaded
+
+By default, only sanitized metadata is uploaded:
+
+- Session timestamps and durations
+- Harness name and version
+- Project name (folder basename only)
+- Model and provider
+- Token counts (input, output, cached)
+- Tool call names and invocation counts
+- Subagent types and counts
+- MCP server names and call counts
+- Skill names and usage
+
+Raw session content (prompts, responses, code, file paths, tool arguments) is **never** uploaded unless full-data mode is explicitly enabled.
+
+## Configuration
+
+Config is stored in `~/.harnessarena/`:
+
+| File | Purpose |
+|------|---------|
+| `config.json` | Production credentials and sync scope |
+| `config.local.json` | Development credentials (when using `--dev`) |
+| `watermarks.json` | Per-file sync progress (shared across environments) |
+
+The sync scope (which harnesses and projects to sync) is saved after confirming a sync in the interactive wizard. Subsequent headless runs use the saved scope.
+
+## History Locations
+
+The uploader reads harness history from standard locations:
+
+| Harness | Default paths |
+|---------|---------------|
+| Claude Code | `~/.claude/projects/`, `~/.claude/history.jsonl` |
+| Codex | `~/.codex/state_5.sqlite`, `~/.codex/sessions/` |
+
+Override with environment variables (e.g., `HARNESSARENA_CLAUDE_HOME`, `HARNESSARENA_CODEX_HOME`).
+
+## Development
+
+```bash
+npm install
+npm run build        # compile TypeScript
+npm run typecheck    # type-check without emitting
+npm run dev -- sync -d -n  # run in dev mode
+```
+
+Requires Node.js 22+.
 
 ## License
 
