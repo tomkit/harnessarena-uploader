@@ -270,6 +270,8 @@ const CLAUDE_AGENTS: Record<string, string> = {
   "general-purpose": "General-purpose agent for multi-step tasks",
   Explore: "Fast agent for codebase exploration and search",
   Plan: "Software architect agent for designing implementation plans",
+  "claude-code-guide": "Agent for answering questions about Claude Code features",
+  "statusline-setup": "Agent for configuring Claude Code status line settings",
 };
 
 const GEMINI_TOOLS: Record<string, string> = {
@@ -600,6 +602,53 @@ export function collectHarnessInventory(
       // Built-in agents → built-in standalone
       for (const [name, description] of Object.entries(CLAUDE_AGENTS).sort(([a], [b]) => a.localeCompare(b))) {
         primitives.push({ type: 'agent', name, scope: 'built-in', source: 'standalone', description });
+      }
+
+      // User agents from ~/.claude/agents/
+      const agentsDir = join(claudeHome, "agents");
+      if (existsSync(agentsDir)) {
+        for (const file of readdirSync(agentsDir).sort()) {
+          if (!file.endsWith(".md")) continue;
+          const name = file.replace(/\.md$/, "");
+          primitives.push({ type: 'agent', name, scope: 'user', source: 'standalone' });
+        }
+      }
+
+      // Plugin agents from installed plugin caches
+      const pluginCacheDir = join(claudeHome, "plugins", "cache");
+      if (existsSync(pluginCacheDir)) {
+        const seenAgents = new Set<string>();
+        try {
+          for (const marketplace of readdirSync(pluginCacheDir)) {
+            const mDir = join(pluginCacheDir, marketplace);
+            if (!statSync(mDir).isDirectory()) continue;
+            for (const pluginName of readdirSync(mDir)) {
+              const pDir = join(mDir, pluginName);
+              if (!statSync(pDir).isDirectory()) continue;
+              const versions = readdirSync(pDir).sort().reverse();
+              for (const ver of versions) {
+                const agDir = join(pDir, ver, "agents");
+                if (!existsSync(agDir)) continue;
+                for (const agentFile of readdirSync(agDir)) {
+                  if (!agentFile.endsWith(".md")) continue;
+                  const agentName = agentFile.replace(/\.md$/, "");
+                  if (seenAgents.has(agentName)) continue;
+                  seenAgents.add(agentName);
+                  primitives.push({
+                    type: 'agent', name: agentName, scope: 'user', source: 'plugin',
+                    plugin: `${pluginName}@${marketplace}`,
+                  });
+                  // Add to the parent plugin's provides list
+                  const parentPlugin = plugins.find(p => p.name === pluginName && p.marketplace === marketplace);
+                  if (parentPlugin && !parentPlugin.provides_mcp_servers.includes(agentName)) {
+                    // No provides_agents field yet, but we track via primitives
+                  }
+                }
+                break; // only latest version
+              }
+            }
+          }
+        } catch { /* ignore */ }
       }
 
       // Built-in MCP servers
