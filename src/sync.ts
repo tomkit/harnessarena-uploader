@@ -720,9 +720,6 @@ export function discoverHarnessInventory(
   return deltas;
 }
 
-// syncHarnessInventory removed — inventory now goes through the normal
-// raw_entries delta path (discoverHarnessInventory returns BlobDelta[]).
-
 // ---------------------------------------------------------------------------
 // Force clean
 // ---------------------------------------------------------------------------
@@ -742,7 +739,6 @@ async function cleanupStaging(
   }).catch(() => {}); // Best effort
 }
 
-// commitForce removed — staging commit now handled server-side via finalize flag on last batch POST
 
 /**
  * Run the full sync flow: discover → sanitize → diff → batch upload.
