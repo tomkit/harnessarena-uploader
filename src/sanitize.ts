@@ -90,6 +90,9 @@ export function sanitizeClaudeEntry(entry: Record<string, unknown>): Record<stri
                 ...(rawInput.description ? { description: rawInput.description } : {}),
                 ...(rawInput.run_in_background ? { run_in_background: rawInput.run_in_background } : {}),
               };
+            } else if (toolName === "Bash" && rawInput.description) {
+              // Preserve the Claude-generated description (not the command itself)
+              sanitizedInput = { description: rawInput.description };
             }
             return {
               type: "tool_use",
@@ -103,6 +106,7 @@ export function sanitizeClaudeEntry(entry: Record<string, unknown>): Record<stri
               type: "tool_result",
               tool_use_id: block.tool_use_id,
               content: "",
+              ...(block.is_error !== undefined ? { is_error: block.is_error } : {}),
             };
           }
           // Unknown block type — strip text-like fields, keep type
