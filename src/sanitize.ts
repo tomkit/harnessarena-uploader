@@ -205,8 +205,20 @@ export function sanitizeCodexEntry(entry: Record<string, unknown>): Record<strin
         }));
       }
     } else if (ptype === "function_call") {
-      // Keep name and call_id, strip arguments
-      payload.arguments = "{}";
+      // Keep name and call_id, preserve safe metadata in arguments
+      const toolName = payload.name as string;
+      let args: Record<string, unknown> = {};
+      try {
+        const raw = typeof payload.arguments === "string" ? JSON.parse(payload.arguments) : (payload.arguments ?? {});
+        if (toolName === "spawn_agent") {
+          if (raw.agent_type) args.agent_type = raw.agent_type;
+          if (raw.model) args.model = raw.model;
+          if (raw.reasoning_effort) args.reasoning_effort = raw.reasoning_effort;
+        } else if (toolName === "wait_agent") {
+          if (raw.timeout_ms) args.timeout_ms = raw.timeout_ms;
+        }
+      } catch { /* ignore */ }
+      payload.arguments = JSON.stringify(args);
     } else if (ptype === "function_call_output") {
       // Keep call_id, strip output
       payload.output = "";
