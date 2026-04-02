@@ -599,6 +599,8 @@ export function collectHarnessInventory(
         primitives.push({ type: 'tool', name, scope: 'built-in', source: 'standalone', description });
       }
 
+      const claudeHome = getClaudeHistoryPaths().home;
+
       // Built-in agents → built-in standalone
       for (const [name, description] of Object.entries(CLAUDE_AGENTS).sort(([a], [b]) => a.localeCompare(b))) {
         primitives.push({ type: 'agent', name, scope: 'built-in', source: 'standalone', description });
@@ -655,8 +657,6 @@ export function collectHarnessInventory(
       for (const name of ['claude-in-chrome', 'computer-use']) {
         primitives.push({ type: 'mcp_server', name, scope: 'built-in', source: 'standalone' });
       }
-
-      const claudeHome = getClaudeHistoryPaths().home;
 
       // 1. User skills from ~/.claude/skills/
       const skillsDir = join(claudeHome, "skills");
