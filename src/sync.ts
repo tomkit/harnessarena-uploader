@@ -440,7 +440,9 @@ export function discoverDeltas(
 // ---------------------------------------------------------------------------
 
 /** Max uncompressed bytes per batch (~4MB, gzip-compressed before sending) */
-const BATCH_MAX_BYTES = 4 * 1024 * 1024;
+// Batch by uncompressed size. JSON compresses ~5-10x with gzip, and Vercel
+// accepts up to 4.5MB compressed. 20MB uncompressed → ~2-4MB on the wire.
+const BATCH_MAX_BYTES = 20 * 1024 * 1024;
 
 interface IngestResult {
   ingested: number;
