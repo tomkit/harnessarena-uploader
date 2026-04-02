@@ -446,6 +446,7 @@ interface IngestResult {
   ingested: number;
   errors: number;
   errorDetails?: Array<{ namespace: string; error: string }>;
+  committed?: { archived: number; promoted: number };
 }
 
 /**
@@ -456,6 +457,7 @@ async function uploadBatchToServer(
   apiUrl: string,
   apiKey: string,
   staging = false,
+  finalize = false,
 ): Promise<IngestResult> {
   const files = deltas.map((d) => ({
     namespace: d.key,
@@ -465,7 +467,7 @@ async function uploadBatchToServer(
   }));
 
   try {
-    const jsonBody = JSON.stringify({ files, staging });
+    const jsonBody = JSON.stringify({ files, staging, finalize });
     const compressed = gzipSync(jsonBody);
     const resp = await fetch(`${apiUrl}/api/v1/sync`, {
       method: "POST",
@@ -738,35 +740,7 @@ async function cleanupStaging(
   }).catch(() => {}); // Best effort
 }
 
-/**
- * Commit staged data: atomically swap staging → production.
- */
-async function commitForce(
-  userSlug: string,
-  harnesses: Harness[],
-  apiUrl: string,
-  apiKey: string,
-  projects?: string[],
-): Promise<boolean> {
-  process.stderr.write("Committing staged data (atomic swap)...\n");
-  const resp = await fetch(`${apiUrl}/api/v1/sync`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ scope: { userSlug, harnesses, projects } }),
-    signal: AbortSignal.timeout(120_000),
-  });
-  if (resp.ok) {
-    const json = await resp.json() as { archived: number; promoted: number };
-    process.stderr.write(`  Archived ${json.archived} old rows, promoted ${json.promoted} new rows.\n`);
-    return true;
-  } else {
-    process.stderr.write(`  Commit failed: HTTP ${resp.status}\n`);
-    return false;
-  }
-}
+// commitForce removed — staging commit now handled server-side via finalize flag on last batch POST
 
 /**
  * Run the full sync flow: discover → sanitize → diff → batch upload.
@@ -791,14 +765,21 @@ export async function runSync(
     // Clean up any leftover staging from a previous interrupted force
     await cleanupStaging(userSlug, apiUrl, apiKey);
 
-    // Clear local watermarks so all files are re-discovered
+    // Clear local watermarks for the scoped harnesses/projects only
     const watermarks = loadWatermarks();
     let cleared = 0;
     for (const key of Object.keys(watermarks)) {
-      if (key.startsWith(userSlug)) {
-        delete watermarks[key];
-        cleared++;
-      }
+      if (!key.startsWith(userSlug)) continue;
+      // key format: {user}/{harness}/{project}/{logType}/{file}
+      const parts = key.split("/");
+      const keyHarness = parts[1];
+      const keyProject = parts[2];
+      // Filter by harness
+      if (!harnesses.includes(keyHarness as Harness)) continue;
+      // Filter by project (if specified via --projects or allowedProjects)
+      if (allowedProjects && allowedProjects.size > 0 && keyProject !== "_global" && !allowedProjects.has(keyProject)) continue;
+      delete watermarks[key];
+      cleared++;
     }
     if (cleared > 0) {
       saveWatermarks(watermarks);
@@ -840,7 +821,8 @@ export async function runSync(
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
-    const batchResult = await uploadBatchToServer(batch, apiUrl, apiKey, force);
+    const isLastBatch = i === batches.length - 1;
+    const batchResult = await uploadBatchToServer(batch, apiUrl, apiKey, force, isLastBatch);
     result.filesUploaded += batchResult.ingested;
 
     // Persist watermarks for succeeded files
@@ -866,6 +848,9 @@ export async function runSync(
     }
 
     process.stderr.write(`  Batch ${i + 1}/${batches.length}: ${batchResult.ingested} ok, ${batchResult.errors} failed\n`);
+    if (batchResult.committed) {
+      process.stderr.write(`  Committed: archived ${batchResult.committed.archived}, promoted ${batchResult.committed.promoted}\n`);
+    }
 
     // Early termination
     if (batchResult.ingested === 0 && batchResult.errors > 0) {
@@ -880,20 +865,6 @@ export async function runSync(
   process.stderr.write(
     `Sync complete: ${result.filesUploaded} file(s) uploaded, ${result.linesUploaded} line(s), ${result.errors.length} error(s)\n`,
   );
-
-  // Force mode: commit staging → production (atomic swap)
-  if (force && result.errors.length === 0 && result.filesUploaded > 0) {
-    // Derive synced projects from the deltas to scope the commit
-    const syncedProjects = [...new Set(deltas.filter(d => d.projectSlug !== "_global").map(d => d.projectSlug))];
-    process.stderr.write(`  Scoped to ${syncedProjects.length} project(s): ${syncedProjects.join(", ") || "(all)"}\n`);
-    const committed = await commitForce(userSlug, harnesses, apiUrl, apiKey, syncedProjects.length > 0 ? syncedProjects : undefined);
-    if (!committed) {
-      process.stderr.write("WARNING: Staging data uploaded but commit failed. Production data unchanged.\n");
-      process.stderr.write("Run --force again to retry, or the staging data will be cleaned up on next force.\n");
-    }
-  } else if (force && result.errors.length > 0) {
-    process.stderr.write("Force sync had errors — staging data NOT committed. Production data unchanged.\n");
-  }
 
   return result;
 }
