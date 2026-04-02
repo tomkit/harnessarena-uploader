@@ -513,28 +513,16 @@ function splitIntoBatches(deltas: BlobDelta[]): BlobDelta[][] {
   for (const delta of deltas) {
     const deltaBytes = delta.lines.reduce((sum, l) => sum + l.length, 0);
 
-    // Oversized file — split its lines across multiple batches
+    // Oversized file — give it its own batch (don't split lines to avoid
+    // duplicate line_number issues on the server). The server handles large
+    // payloads by chunking INSERTs internally.
     if (deltaBytes > BATCH_MAX_BYTES) {
       if (current.length > 0) {
         batches.push(current);
         current = [];
         currentBytes = 0;
       }
-      // Split lines into chunks that fit in BATCH_MAX_BYTES
-      let chunkLines: string[] = [];
-      let chunkBytes = 0;
-      for (const line of delta.lines) {
-        if (chunkLines.length > 0 && chunkBytes + line.length > BATCH_MAX_BYTES) {
-          batches.push([{ ...delta, lines: chunkLines }]);
-          chunkLines = [];
-          chunkBytes = 0;
-        }
-        chunkLines.push(line);
-        chunkBytes += line.length;
-      }
-      if (chunkLines.length > 0) {
-        batches.push([{ ...delta, lines: chunkLines }]);
-      }
+      batches.push([delta]);
       continue;
     }
 
