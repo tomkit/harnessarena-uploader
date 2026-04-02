@@ -24,9 +24,11 @@ import { Harness } from "./models.js";
 import {
   sanitizeClaudeJsonlFile,
   sanitizeClaudeHistoryFile,
+  sanitizeClaudeHistoryFileByProject,
   sanitizeCodexRolloutFile,
   sanitizeCodexThreadsDb,
   sanitizeCodexSpawnEdges,
+  extractCodexThreadProjectMap,
   sanitizeGeminiSessionFile,
   sanitizeCursorDb,
   sanitizeOpenCodeDb,
@@ -276,14 +278,14 @@ function discoverClaudeDeltas(
     }
   }
 
-  // 2. history.jsonl (append mode)
+  // 2. history.jsonl — split by project (replace mode per project)
   if (existsSync(paths.historyPath)) {
-    const allLines = sanitizeClaudeHistoryFile(paths.historyPath, allowedProjects);
-    const key = blobKey(userSlug, "claude", "_global", "history", "history.jsonl");
-    const wm = getWatermark(key);
-    const { newLines, lastLineHash, lastLineNumber } = computeAppendDelta(allLines, wm?.mode === "append" ? wm : null);
-    const delta = makeAppendDelta(key, newLines, lastLineHash, lastLineNumber, wm?.mode === "append" ? wm : null, "_global", "history");
-    if (delta) deltas.push(delta);
+    const byProject = sanitizeClaudeHistoryFileByProject(paths.historyPath, allowedProjects);
+    for (const [slug, lines] of byProject) {
+      const key = blobKey(userSlug, "claude", slug, "history", "history.jsonl");
+      const delta = makeReplaceDelta(key, lines, hashContent(lines.join("\n")), slug, "history");
+      if (delta) deltas.push(delta);
+    }
   }
 
   return deltas;
@@ -299,28 +301,37 @@ function discoverCodexDeltas(
   if (existsSync(paths.stateDbPath)) {
     const lines = sanitizeCodexThreadsDb(paths.stateDbPath);
     if (lines.length > 0) {
-      const key = blobKey(userSlug, "codex", "_global", "meta", "threads.jsonl");
-      const delta = makeReplaceDelta(key, lines, hashContent(lines.join("\n")), "_global", "meta");
+      const key = blobKey(userSlug, "codex", "_harness", "meta", "threads.jsonl");
+      const delta = makeReplaceDelta(key, lines, hashContent(lines.join("\n")), "_harness", "meta");
       if (delta) deltas.push(delta);
     }
 
     const edgeLines = sanitizeCodexSpawnEdges(paths.stateDbPath);
     if (edgeLines.length > 0) {
-      const key = blobKey(userSlug, "codex", "_global", "meta", "spawn_edges.jsonl");
-      const delta = makeReplaceDelta(key, edgeLines, hashContent(edgeLines.join("\n")), "_global", "meta");
+      const key = blobKey(userSlug, "codex", "_harness", "meta", "spawn_edges.jsonl");
+      const delta = makeReplaceDelta(key, edgeLines, hashContent(edgeLines.join("\n")), "_harness", "meta");
       if (delta) deltas.push(delta);
     }
   }
 
-  // 2. Rollout JSONL files (append mode)
+  // 2. Rollout JSONL files (append mode) — resolve project from threads
   if (existsSync(paths.sessionsDir)) {
+    // Build session_id → project_slug map from threads DB
+    const threadProjectMap = existsSync(paths.stateDbPath)
+      ? extractCodexThreadProjectMap(paths.stateDbPath)
+      : new Map<string, string>();
+
     for (const file of readdirRecursive(paths.sessionsDir, ".jsonl")) {
       const relPath = relative(paths.sessionsDir, file);
       const allLines = sanitizeCodexRolloutFile(file);
-      const key = blobKey(userSlug, "codex", "_global", "session", relPath);
+      // Extract session ID from filename: rollout-...-{session_id}.jsonl
+      const filenameMatch = basename(file).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/);
+      const sessionId = filenameMatch?.[1] ?? "";
+      const projectSlug = threadProjectMap.get(sessionId) ?? "_harness";
+      const key = blobKey(userSlug, "codex", projectSlug, "session", relPath);
       const wm = getWatermark(key);
       const { newLines, lastLineHash, lastLineNumber } = computeAppendDelta(allLines, wm?.mode === "append" ? wm : null);
-      const delta = makeAppendDelta(key, newLines, lastLineHash, lastLineNumber, wm?.mode === "append" ? wm : null, "_global", "session");
+      const delta = makeAppendDelta(key, newLines, lastLineHash, lastLineNumber, wm?.mode === "append" ? wm : null, projectSlug, "session");
       if (delta) deltas.push(delta);
     }
   }
@@ -374,8 +385,8 @@ function discoverCursorDeltas(
     const lines = sanitizeCursorDb(dbFile);
     if (lines.length === 0) continue;
 
-    const key = blobKey(userSlug, "cursor", "_global", "session", `${uuid}.jsonl`);
-    const delta = makeReplaceDelta(key, lines, hashContent(lines.join("\n")), "_cursor", "session");
+    const key = blobKey(userSlug, "cursor", "_harness", "session", `${uuid}.jsonl`);
+    const delta = makeReplaceDelta(key, lines, hashContent(lines.join("\n")), "_harness", "session");
     if (delta) deltas.push(delta);
   }
 
@@ -393,8 +404,8 @@ function discoverOpenCodeDeltas(
   const lines = sanitizeOpenCodeDb(paths.dbPath);
   if (lines.length === 0) return deltas;
 
-  const key = blobKey(userSlug, "opencode", "_global", "session", "opencode.jsonl");
-  const delta = makeReplaceDelta(key, lines, hashContent(lines.join("\n")), "_global", "session");
+  const key = blobKey(userSlug, "opencode", "_harness", "session", "opencode.jsonl");
+  const delta = makeReplaceDelta(key, lines, hashContent(lines.join("\n")), "_harness", "session");
   if (delta) deltas.push(delta);
 
   return deltas;
@@ -428,8 +439,8 @@ export function discoverDeltas(
       case Harness.OPENCODE: deltas = discoverOpenCodeDeltas(userSlug); break;
       default: deltas = [];
     }
-    // Apply project filter. _global projects always pass (cross-project data).
-    allDeltas.push(...deltas.filter((d) => d.projectSlug === "_global" || pf(harness, d.projectSlug)));
+    // Apply project filter. _harness projects always pass (harness-level config data).
+    allDeltas.push(...deltas.filter((d) => d.projectSlug === "_harness" || pf(harness, d.projectSlug)));
   }
 
   return allDeltas;
@@ -630,7 +641,7 @@ async function syncProjectAliases(
  * Collect harness inventory for sync as BlobDelta entries.
  *
  * Produces two scopes per harness:
- *   - _global (user-level): native tools, agents, user-level skills/plugins
+ *   - _harness (harness-level): native tools, agents, user-level skills/plugins
  *   - per-project: project-scoped plugins and MCP servers (Claude, Gemini)
  *
  * Each inventory blob is uploaded as a replace-mode raw_entries row with
@@ -644,14 +655,14 @@ export function discoverHarnessInventory(
   const deltas: BlobDelta[] = [];
 
   for (const harness of harnesses) {
-    // 1. User-level (_global) inventory — new primitives/plugins format
+    // 1. Harness-level (_harness) inventory — new primitives/plugins format
     const inv = collectHarnessInventory(harness);
     const globalData = JSON.stringify({
       primitives: inv.primitives,
       plugins: inv.plugins,
     });
-    const globalKey = blobKey(userSlug, harness, "_global", "inventory", "primitives.json");
-    const globalDelta = makeReplaceDelta(globalKey, [globalData], hashContent(globalData), "_global", "inventory");
+    const globalKey = blobKey(userSlug, harness, "_harness", "inventory", "primitives.json");
+    const globalDelta = makeReplaceDelta(globalKey, [globalData], hashContent(globalData), "_harness", "inventory");
     if (globalDelta) deltas.push(globalDelta);
 
     // 2. Project-level inventory (Claude and Gemini only)
@@ -763,7 +774,7 @@ export async function runSync(
       // Filter by harness
       if (!harnesses.includes(keyHarness as Harness)) continue;
       // Filter by project (if specified via --projects or allowedProjects)
-      if (allowedProjects && allowedProjects.size > 0 && keyProject !== "_global" && !allowedProjects.has(keyProject)) continue;
+      if (allowedProjects && allowedProjects.size > 0 && keyProject !== "_harness" && !allowedProjects.has(keyProject)) continue;
       delete watermarks[key];
       cleared++;
     }
@@ -791,7 +802,7 @@ export async function runSync(
   const sessionDeltas = discoverDeltas(harnesses, userSlug, projectFilter, allowedProjects);
   const deltas = [...inventoryDeltas, ...sessionDeltas]
     .filter((d) => d.lines.length > 0)
-    .filter((d) => d.projectSlug === "_global" || !allowedProjects || allowedProjects.has(d.projectSlug));
+    .filter((d) => d.projectSlug === "_harness" || !allowedProjects || allowedProjects.has(d.projectSlug));
   result.filesScanned = deltas.length;
 
   if (deltas.length === 0) {

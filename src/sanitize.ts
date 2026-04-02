@@ -483,6 +483,55 @@ export function sanitizeClaudeHistoryFile(filePath: string, allowedProjects?: Se
 }
 
 /**
+ * Sanitize a Claude history.jsonl file, grouped by project slug.
+ * Returns a Map of project_slug → sanitized lines.
+ */
+export function sanitizeClaudeHistoryFileByProject(filePath: string, allowedProjects?: Set<string>): Map<string, string[]> {
+  if (!existsSync(filePath)) return new Map();
+  const byProject = new Map<string, string[]>();
+  for (const line of readFileSync(filePath, "utf-8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      const projectPath = entry.project || "";
+      const slug = projectPath.split("/").pop() || "_unknown";
+      // Filter by project if allowedProjects is set
+      if (allowedProjects && projectPath) {
+        if (!allowedProjects.has(slug)) continue;
+      }
+      if (!byProject.has(slug)) byProject.set(slug, []);
+      byProject.get(slug)!.push(JSON.stringify(sanitizeClaudeHistoryEntry(entry)));
+    } catch {
+      continue;
+    }
+  }
+  return byProject;
+}
+
+/**
+ * Extract raw session_id → project_slug mapping from Codex threads SQLite.
+ * Uses the raw `cwd` field (before sanitization) to derive project basenames.
+ */
+export function extractCodexThreadProjectMap(dbPath: string): Map<string, string> {
+  if (!existsSync(dbPath)) return new Map();
+  try {
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db.prepare("SELECT id, cwd FROM threads").all() as { id: string; cwd: string }[];
+    db.close();
+    const map = new Map<string, string>();
+    for (const row of rows) {
+      if (row.id && row.cwd) {
+        const slug = basename(row.cwd.replace(/[/\\]+$/, "")) || "_unknown";
+        map.set(row.id, slug);
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
  * Sanitize a Codex rollout JSONL file. Returns sanitized lines.
  */
 export function sanitizeCodexRolloutFile(filePath: string): string[] {
