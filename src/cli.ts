@@ -551,7 +551,7 @@ async function main(): Promise<void> {
     }
     process.stderr.write("\n--- DRY RUN: deltas below ---\n\n");
     for (const d of deltas) {
-      process.stdout.write(`${d.uploadType} ${d.key} (${d.lines.length} lines)\n`);
+      process.stdout.write(`${d.mode} ${d.key} (${d.lines.length} lines, offset=${d.lineOffset})\n`);
     }
     process.exit(0);
   }

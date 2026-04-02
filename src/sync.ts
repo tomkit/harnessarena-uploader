@@ -64,14 +64,10 @@ export interface BlobDelta {
   key: string;
   /** append or replace */
   mode: "append" | "replace";
-  /**
-   * full    — first sync of this source file (no prior watermark)
-   * partial — delta from watermark to EOF on an append-only source
-   * replace — new version of a rewritable source (gemini/cursor/opencode)
-   */
-  uploadType: "full" | "partial" | "replace";
   /** Sanitized lines to upload */
   lines: string[];
+  /** Line number offset for split file chunks (0-based). Server adds this to line_number. */
+  lineOffset: number;
   /** Project slug derived from the file path */
   projectSlug: string;
   /** Log type identifier */
@@ -179,8 +175,8 @@ function makeAppendDelta(
   return {
     key,
     mode: "append",
-    uploadType: existingWatermark ? "partial" : "full",
     lines: newLines,
+    lineOffset: existingWatermark?.totalLinesUploaded ?? 0,
     projectSlug,
     logType,
     pendingWatermark: {
@@ -209,8 +205,8 @@ function makeReplaceDelta(
   return {
     key,
     mode: "replace",
-    uploadType: "replace",
     lines,
+    lineOffset: 0,
     projectSlug,
     logType,
     pendingWatermark: {
@@ -474,9 +470,9 @@ async function uploadBatchToServer(
 ): Promise<IngestResult> {
   const files = deltas.map((d) => ({
     namespace: d.key,
-    type: d.uploadType,
     content: d.lines.join("\n"),
     contentHash: hashContent(d.lines.join("\n")),
+    lineOffset: d.lineOffset,
   }));
 
   try {
@@ -524,16 +520,29 @@ function splitIntoBatches(deltas: BlobDelta[]): BlobDelta[][] {
   for (const delta of deltas) {
     const deltaBytes = delta.lines.reduce((sum, l) => sum + l.length, 0);
 
-    // Oversized file — give it its own batch (don't split lines to avoid
-    // duplicate line_number issues on the server). The server handles large
-    // payloads by chunking INSERTs internally.
+    // Oversized file — split lines into chunks with lineOffset tracking
     if (deltaBytes > BATCH_MAX_BYTES) {
       if (current.length > 0) {
         batches.push(current);
         current = [];
         currentBytes = 0;
       }
-      batches.push([delta]);
+      let chunkLines: string[] = [];
+      let chunkBytes = 0;
+      let offset = delta.lineOffset;
+      for (const line of delta.lines) {
+        if (chunkLines.length > 0 && chunkBytes + line.length > BATCH_MAX_BYTES) {
+          batches.push([{ ...delta, lines: chunkLines, lineOffset: offset }]);
+          offset += chunkLines.length;
+          chunkLines = [];
+          chunkBytes = 0;
+        }
+        chunkLines.push(line);
+        chunkBytes += line.length;
+      }
+      if (chunkLines.length > 0) {
+        batches.push([{ ...delta, lines: chunkLines, lineOffset: offset }]);
+      }
       continue;
     }
 
