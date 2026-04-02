@@ -821,21 +821,16 @@ export async function runSync(
   const batches = splitIntoBatches(deltas);
   process.stderr.write(`Uploading in ${batches.length} batch(es)...\n`);
 
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    const isLastBatch = i === batches.length - 1;
-    const batchResult = await uploadBatchToServer(batch, apiUrl, apiKey, force, isLastBatch);
-    result.filesUploaded += batchResult.ingested;
+  const UPLOAD_CONCURRENCY = 3;
 
-    // Persist watermarks for succeeded files
+  function processBatchResult(batch: BlobDelta[], batchResult: IngestResult, batchNum: number) {
+    result.filesUploaded += batchResult.ingested;
     if (batchResult.ingested === batch.length) {
-      // All succeeded
       for (const delta of batch) {
         result.linesUploaded += delta.lines.length;
         setWatermark(delta.pendingWatermark.key, delta.pendingWatermark.watermark);
       }
     } else {
-      // Partial success — figure out which failed from errorDetails
       const failedNamespaces = new Set(
         batchResult.errorDetails?.map((e) => e.namespace) ?? [],
       );
@@ -848,20 +843,45 @@ export async function runSync(
         }
       }
     }
-
-    process.stderr.write(`  Batch ${i + 1}/${batches.length}: ${batchResult.ingested} ok, ${batchResult.errors} failed\n`);
+    process.stderr.write(`  Batch ${batchNum}/${batches.length}: ${batchResult.ingested} ok, ${batchResult.errors} failed\n`);
     if (batchResult.committed) {
       process.stderr.write(`  Committed: archived ${batchResult.committed.archived}, promoted ${batchResult.committed.promoted}\n`);
     }
+  }
 
-    // Early termination
-    if (batchResult.ingested === 0 && batchResult.errors > 0) {
-      process.stderr.write(`  Aborting: entire batch failed.\n`);
-      for (let j = i + 1; j < batches.length; j++) {
-        for (const d of batches[j]) result.errors.push(d.key);
+  // Upload non-final batches in parallel, then send finalize batch last
+  if (batches.length > 1) {
+    const nonFinalBatches = batches.slice(0, -1);
+    // Upload in waves of UPLOAD_CONCURRENCY
+    for (let i = 0; i < nonFinalBatches.length; i += UPLOAD_CONCURRENCY) {
+      const wave = nonFinalBatches.slice(i, i + UPLOAD_CONCURRENCY);
+      const results = await Promise.all(
+        wave.map((batch, j) => uploadBatchToServer(batch, apiUrl, apiKey, force, false)
+          .then(r => ({ batch, result: r, idx: i + j }))
+          .catch(() => ({ batch, result: { ingested: 0, errors: batch.length } as IngestResult, idx: i + j }))
+        )
+      );
+      let aborted = false;
+      for (const { batch, result: batchResult, idx } of results) {
+        processBatchResult(batch, batchResult, idx + 1);
+        if (batchResult.ingested === 0 && batchResult.errors > 0) aborted = true;
       }
-      break;
+      if (aborted) {
+        process.stderr.write(`  Aborting: batch failed.\n`);
+        for (let j = i + wave.length; j < nonFinalBatches.length; j++) {
+          for (const d of nonFinalBatches[j]) result.errors.push(d.key);
+        }
+        for (const d of batches[batches.length - 1]) result.errors.push(d.key);
+        break;
+      }
     }
+  }
+
+  // Send finalize batch (always last, always sequential)
+  if (result.errors.length === 0 || batches.length === 1) {
+    const lastBatch = batches[batches.length - 1];
+    const batchResult = await uploadBatchToServer(lastBatch, apiUrl, apiKey, force, true);
+    processBatchResult(lastBatch, batchResult, batches.length);
   }
 
   process.stderr.write(
