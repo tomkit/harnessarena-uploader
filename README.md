@@ -4,13 +4,10 @@ Upload your AI coding harness usage stats to [HarnessArena](https://harnessarena
 
 ## Supported Harnesses
 
-| Harness | Binary | Status |
-|---------|--------|--------|
-| Claude Code | `claude` | ✅ |
-| Gemini CLI | `gemini` | ✅ |
-| Codex (OpenAI) | `codex` | ✅ |
-| Cursor Agent | `agent` | ✅ |
-| OpenCode | `opencode` | ✅ |
+| Harness        | Binary   | Status |
+| -------------- | -------- | ------ |
+| Claude Code    | `claude` | ✅     |
+| Codex (OpenAI) | `codex`  | ✅     |
 
 ## Quick Start
 
@@ -38,6 +35,7 @@ python3 harnessarena_uploader.py --since 2026-03-01
 ```
 
 By default, the script starts an interactive wizard when run in a real terminal with no selection flags. The wizard:
+
 - detects likely-installed harnesses
 - lets you choose which harnesses to scan
 - shows the project table and lets you choose projects
@@ -82,6 +80,7 @@ PROJECT  HARNESSES  SESSIONS  COMPLETENESS
 ```
 
 Completeness values:
+
 - `full`: project has at least one full session history record
 - `partial`: project was recovered only from lightweight metadata/index records
 - `prompts_only`: project was recovered only from prompt-history supplements
