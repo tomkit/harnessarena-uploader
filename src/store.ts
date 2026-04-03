@@ -65,7 +65,7 @@ function writeJson(path: string, data: unknown): void {
 export type SyncScope = Record<string, string[] | false>;
 
 export interface Config {
-  /** API key for harnessarena.com */
+  /** API key for harnessarena.ai */
   apiKey?: string;
   /** User slug (GitHub username, set during login) */
   userSlug?: string;

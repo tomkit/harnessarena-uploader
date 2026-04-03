@@ -1,6 +1,6 @@
 # Harness Arena Uploader
 
-Sync your Claude Code and Codex session metadata to [Harness Arena](https://harnessarena.com) where you can analyze yourt vibes.
+Sync your Claude Code and Codex session metadata to [Harness Arena](https://www.harnessarena.ai) where you can analyze yourt vibes.
 
 Only aggregated metrics are uploaded by default; raw session content requires full-data mode. All uploaded data can be exported or permanently deleted at any time.
 

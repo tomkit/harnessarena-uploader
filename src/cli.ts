@@ -35,7 +35,7 @@ import { VERSION } from "./version.js";
 // Only scan supported harnesses (gemini, cursor, opencode not yet supported)
 const ALL_HARNESSES = [Harness.CLAUDE, Harness.CODEX];
 const VALID_HARNESS_NAMES = [...ALL_HARNESSES.map((h) => h as string), "all"];
-const PROD_URL = "https://harnessarena.com";
+const PROD_URL = "https://www.harnessarena.ai";
 const DEV_URL = "http://localhost:3000";
 
 /** Detect --dev/-d early (before commander parses) and set dev mode globally. */
