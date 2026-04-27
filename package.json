@@ -1,7 +1,7 @@
 {
   "name": "harnessarena-uploader",
   "version": "0.1.1",
-  "description": "Extract metadata from AI coding harness sessions and upload to harnessarena.com",
+  "description": "Extract metadata from AI coding harness sessions and upload to harnessarena.ai",
   "type": "module",
   "bin": {
     "harnessarena-uploader": "./dist/cli.js"
